@@ -4,6 +4,7 @@ mod error;
 pub(crate) mod replay_journal;
 mod snapshot;
 mod types;
+mod valuation;
 
 pub use crate::engine::*;
 pub use crate::error::{Error, Result};
