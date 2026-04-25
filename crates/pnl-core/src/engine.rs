@@ -1,6 +1,6 @@
 use crate::accounting::{apply_average_cost_fill, AverageCostFill};
 use crate::error::{Error, Result};
-use crate::replay_journal::{JournalAction, ReplayJournal};
+use crate::replay_journal::ReplayJournal;
 use crate::snapshot::{CanonicalStateV1, StateHash};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
@@ -302,27 +302,7 @@ impl Engine {
     }
 
     pub fn apply(&mut self, event: Event) -> Result<ApplyResult> {
-        let action = self
-            .replay_journal
-            .prepare(self.config.expected_start_seq, &event)?;
-        if action == JournalAction::RewriteHistory {
-            return self.apply_history_rewrite(event);
-        }
-
-        let (changed_positions, cash_delta, realized_delta, drawdown_accounts) =
-            self.apply_accounting_effect(&event, &event.kind)?;
-        for account_id in drawdown_accounts {
-            self.update_drawdown(account_id)?;
-        }
-
-        self.replay_journal.record_accepted(event);
-        Ok(ApplyResult {
-            sequence: self.replay_journal.last_seq(),
-            changed_positions,
-            realized_pnl_delta: realized_delta,
-            cash_delta,
-            state_hash: self.state_hash(),
-        })
+        crate::replay_journal::apply_event(self, event)
     }
 
     pub fn position(&self, key: PositionKey) -> Option<&Position> {
@@ -460,41 +440,6 @@ impl Engine {
             realized_delta,
             drawdown_accounts,
         ))
-    }
-
-    fn apply_history_rewrite(&mut self, event: Event) -> Result<ApplyResult> {
-        let target = self.replay_journal.validate_rewrite_target(&event)?;
-        let before_account = self
-            .accounts
-            .get(&target.account_id)
-            .ok_or(Error::UnknownAccount(target.account_id))?
-            .clone();
-
-        let mut next = self.clone();
-        next.replay_journal.record_accepted(event);
-        let mut journal = std::mem::take(&mut next.replay_journal);
-        journal.rebuild_engine(&mut next)?;
-        next.replay_journal = journal;
-
-        let after_account = next
-            .accounts
-            .get(&target.account_id)
-            .ok_or(Error::UnknownAccount(target.account_id))?;
-        let cash_delta = after_account.cash.checked_sub(before_account.cash)?;
-        let realized_delta = after_account
-            .realized_pnl
-            .checked_sub(before_account.realized_pnl)?;
-        let sequence = next.replay_journal.last_seq();
-        let state_hash = next.state_hash();
-        *self = next;
-
-        Ok(ApplyResult {
-            sequence,
-            changed_positions: vec![target.position_key],
-            realized_pnl_delta: realized_delta,
-            cash_delta,
-            state_hash,
-        })
     }
 
     pub(super) fn reset_accounting_state_for_replay(&mut self) {
