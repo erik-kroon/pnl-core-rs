@@ -13,12 +13,13 @@ V1 is intentionally narrow:
 - Typed IDs for accounts, books, instruments, currencies, and events.
 - Cash-authoritative accounting.
 - Average-cost position accounting.
+- Trade corrections and busts through deterministic historical replay.
 - Fixed-point `i128` arithmetic with account money scale `4`.
 - Strict contiguous event replay.
 - Versioned `.pnlsnap` snapshot/restore.
 - Public deterministic `state_hash()`.
 
-Not included in v1: FIFO/LIFO, trade corrections/busts, Python/C/WASM bindings, Arrow/Parquet export, broker connectors, order management, or strategy logic.
+Not included in v1: FIFO/LIFO, Python/C/WASM bindings, Arrow/Parquet export, broker connectors, order management, or strategy logic.
 
 ## Core Invariants
 
@@ -36,7 +37,7 @@ Not included in v1: FIFO/LIFO, trade corrections/busts, Python/C/WASM bindings, 
 - Average-cost accounting only.
 - Currency metadata must use the configured account money scale.
 - No FIFO/LIFO lots.
-- No corrections/busts.
+- Corrections and busts can only target prior fill events and corrections must keep the original account, book, and instrument.
 - No settlement model.
 - No dividends, funding payments, or borrow fees.
 - State hash is a deterministic fingerprint, not a cryptographic audit proof.
@@ -142,6 +143,8 @@ Supported event types are:
 - `fill`
 - `mark`
 - `fx_rate`
+- `trade_correction`
+- `trade_bust`
 
 An `fx_rate` event supplies a direct conversion rate as target currency units per one source currency unit:
 
@@ -150,6 +153,20 @@ An `fx_rate` event supplies a direct conversion rate as target currency units pe
 ```
 
 Cross-currency fills, fees, and marked exposures require a direct rate from the source currency to the account currency unless both currencies are the same. Fill fees default to the config `base_currency`; set `fee_currency` on fill events when the fee is charged in another currency.
+
+A `trade_correction` replaces a prior fill, then the engine replays later events from the retained event journal:
+
+```json
+{"seq":4,"type":"trade_correction","original_event_id":2,"account_id":1,"book_id":1,"instrument_id":1,"side":"buy","qty":"100","price":"9.00","fee":"0","ts_unix_ns":4}
+```
+
+A `trade_bust` removes a prior fill and replays later events:
+
+```json
+{"seq":5,"type":"trade_bust","original_event_id":2,"reason":"venue bust","ts_unix_ns":5}
+```
+
+Corrections and busts must target a prior `fill` event. A correction may adjust side, quantity, price, or fee, but must keep the same account, book, and instrument as the original fill.
 
 ## Snapshots
 
@@ -160,7 +177,7 @@ Production snapshots use:
 - Postcard/Serde payload
 - BLAKE3 payload hash
 
-The payload stores canonical accounting state, not raw implementation internals. JSON snapshot export is intended for debugging, golden tests, and review.
+The payload stores canonical accounting state, not raw implementation internals. JSON snapshot export is intended for debugging, golden tests, and review. Snapshots retain the accepted event journal so restored engines can apply later corrections and busts.
 
 ## Validation
 
@@ -175,7 +192,6 @@ Benchmark output is hardware-dependent. Current benchmark targets cover `apply_f
 ## Roadmap
 
 - FIFO/LIFO accounting.
-- Corrections and busts.
 - Python bindings.
 - C ABI.
 - WASM package.

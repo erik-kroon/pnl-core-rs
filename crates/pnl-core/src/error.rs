@@ -17,6 +17,12 @@ pub enum Error {
     UnknownCurrency(CurrencyId),
     #[error("duplicate event {0:?}")]
     DuplicateEvent(EventId),
+    #[error("unknown original event {0:?}")]
+    UnknownOriginalEvent(EventId),
+    #[error("correction target is not a fill event {0:?}")]
+    CorrectionTargetNotFill(EventId),
+    #[error("correction replacement must keep the original account, book, and instrument")]
+    CorrectionKeyMismatch,
     #[error("out-of-order event: expected sequence {expected}, received {received}")]
     OutOfOrderEvent { expected: u64, received: u64 },
     #[error("invalid quantity")]
