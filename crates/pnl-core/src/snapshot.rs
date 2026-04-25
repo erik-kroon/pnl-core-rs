@@ -1,13 +1,9 @@
-use crate::account::AccountState;
-use crate::config::EngineConfig;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
-use crate::event::Event;
-use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
-use crate::position::{FxRate, Mark, Position};
+use crate::metadata::AccountMeta;
 use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
-use crate::types::*;
+use crate::state_hash::{hash_canonical_state, CanonicalStateV1, StateHash};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
@@ -16,24 +12,6 @@ const SNAPSHOT_VERSION: u16 = 1;
 const SNAPSHOT_CODEC_POSTCARD: u8 = 1;
 const SNAPSHOT_COMPRESSION_NONE: u8 = 0;
 const HEADER_LEN: usize = 56;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateHash(pub [u8; 32]);
-
-impl StateHash {
-    pub const fn zero() -> Self {
-        Self([0; 32])
-    }
-
-    pub(crate) fn from_canonical(state: &CanonicalStateV1) -> Self {
-        let bytes = postcard::to_allocvec(state).expect("canonical state should serialize");
-        Self(*blake3::hash(&bytes).as_bytes())
-    }
-
-    pub fn to_hex(self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMetadataV1 {
@@ -48,43 +26,7 @@ pub struct SnapshotV1 {
     pub state: CanonicalStateV1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CanonicalStateV1 {
-    pub config: EngineConfig,
-    pub currencies: Vec<CurrencyMeta>,
-    pub accounts: Vec<AccountState>,
-    pub books: Vec<BookMeta>,
-    pub instruments: Vec<InstrumentMeta>,
-    pub positions: Vec<Position>,
-    pub marks: Vec<Mark>,
-    pub fx_rates: Vec<FxRate>,
-    pub seen_events: Vec<EventId>,
-    pub event_log: Vec<Event>,
-    pub last_seq: u64,
-}
-
 impl CanonicalStateV1 {
-    pub(crate) fn from_engine(engine: &Engine) -> Self {
-        Self {
-            config: engine.config.clone(),
-            currencies: engine.registry.currencies().cloned().collect(),
-            accounts: engine.accounts.values().cloned().collect(),
-            books: engine.registry.books().collect(),
-            instruments: engine.registry.instruments().cloned().collect(),
-            positions: engine.positions.values().cloned().collect(),
-            marks: engine.marks.values().cloned().collect(),
-            fx_rates: engine.fx_rates.values().cloned().collect(),
-            seen_events: engine
-                .replay_journal
-                .seen_events()
-                .iter()
-                .copied()
-                .collect(),
-            event_log: engine.replay_journal.events().to_vec(),
-            last_seq: engine.replay_journal.last_seq(),
-        }
-    }
-
     fn into_engine(self) -> Engine {
         let accounts = self.accounts;
         let registry = Registry::from_parts(
@@ -143,7 +85,7 @@ impl CanonicalStateV1 {
 impl Engine {
     pub fn snapshot(&self) -> Result<SnapshotV1> {
         let state = CanonicalStateV1::from_engine(self);
-        let state_hash = StateHash::from_canonical(&state);
+        let state_hash = hash_canonical_state(&state);
         Ok(SnapshotV1 {
             metadata: SnapshotMetadataV1 {
                 snapshot_sequence: self.replay_journal.last_seq(),
@@ -155,7 +97,7 @@ impl Engine {
     }
 
     pub fn restore(snapshot: SnapshotV1) -> Result<Self> {
-        let hash = StateHash::from_canonical(&snapshot.state);
+        let hash = hash_canonical_state(&snapshot.state);
         if hash != snapshot.metadata.state_hash {
             return Err(Error::SnapshotHashMismatch);
         }

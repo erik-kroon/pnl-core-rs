@@ -1,5 +1,5 @@
 use crate::position::PositionKey;
-use crate::snapshot::StateHash;
+use crate::state_hash::StateHash;
 use crate::types::{AccountId, CurrencyId, Money, Ratio};
 use serde::{Deserialize, Serialize};
 
