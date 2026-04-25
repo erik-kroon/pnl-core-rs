@@ -33,10 +33,15 @@ pub enum Error {
     ShortPositionNotAllowed,
     #[error("position flips are not allowed")]
     PositionFlipNotAllowed,
-    #[error("multi-currency is unsupported in v1: instrument={instrument_currency:?}, account={account_currency:?}")]
-    MultiCurrencyUnsupported {
-        instrument_currency: CurrencyId,
-        account_currency: CurrencyId,
+    #[error("missing fx rate from {from_currency:?} to {to_currency:?}")]
+    MissingFxRate {
+        from_currency: CurrencyId,
+        to_currency: CurrencyId,
+    },
+    #[error("currency mismatch: money={money_currency:?}, expected={expected_currency:?}")]
+    CurrencyMismatch {
+        money_currency: CurrencyId,
+        expected_currency: CurrencyId,
     },
     #[error("unsupported event type {0}")]
     UnsupportedEventType(&'static str),

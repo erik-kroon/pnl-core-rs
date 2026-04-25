@@ -9,7 +9,7 @@ Deterministic fixed-point PnL, position, and exposure accounting for real-time t
 V1 is intentionally narrow:
 
 - Rust-only core crate plus a replay CLI.
-- Single base currency.
+- Multi-currency instruments and accounts with direct FX conversion into each account currency.
 - Typed IDs for accounts, books, instruments, currencies, and events.
 - Cash-authoritative accounting.
 - Average-cost position accounting.
@@ -18,7 +18,7 @@ V1 is intentionally narrow:
 - Versioned `.pnlsnap` snapshot/restore.
 - Public deterministic `state_hash()`.
 
-Not included in v1: FX, FIFO/LIFO, trade corrections/busts, Python/C/WASM bindings, Arrow/Parquet export, broker connectors, order management, or strategy logic.
+Not included in v1: FIFO/LIFO, trade corrections/busts, Python/C/WASM bindings, Arrow/Parquet export, broker connectors, order management, or strategy logic.
 
 ## Core Invariants
 
@@ -32,10 +32,9 @@ Not included in v1: FX, FIFO/LIFO, trade corrections/busts, Python/C/WASM bindin
 
 ## Known Limitations
 
-- Single account currency only.
+- FX uses explicit direct rates only; inverse and cross-rate routing are not inferred.
 - Average-cost accounting only.
-- Fees are assumed to be in account currency.
-- No FX conversion.
+- Currency metadata must use the configured account money scale.
 - No FIFO/LIFO lots.
 - No corrections/busts.
 - No settlement model.
@@ -119,13 +118,13 @@ println!("{summary:?}");
 - Equity is derived as `cash + position_market_value`.
 - Positive fee means cost.
 - Negative fee means rebate.
-- Fees are assumed to be in account currency.
+- Fees are converted into account currency before cash and realized PnL updates.
 - Fees reduce cash immediately.
 - Fees are recognized immediately in realized PnL.
 - Fees are not capitalized into average price.
 - Position cost basis is tracked separately from rounded average price so summaries reconcile under fixed-point rounding.
 - If no mark is available, position market value uses signed cost basis and unrealized PnL is zero.
-- Once a mark is available, unrealized PnL is `marked_market_value - signed_cost_basis`.
+- Once a mark is available, unrealized PnL is account-currency `marked_market_value - signed_cost_basis`.
 
 ## Replay Contract
 
@@ -142,6 +141,15 @@ Supported event types are:
 - `cash_adjustment`
 - `fill`
 - `mark`
+- `fx_rate`
+
+An `fx_rate` event supplies a direct conversion rate as target currency units per one source currency unit:
+
+```json
+{"seq":2,"type":"fx_rate","from_currency":"EUR","to_currency":"USD","rate":"1.10","ts_unix_ns":2}
+```
+
+Cross-currency fills, fees, and marked exposures require a direct rate from the source currency to the account currency unless both currencies are the same. Fill fees default to the config `base_currency`; set `fee_currency` on fill events when the fee is charged in another currency.
 
 ## Snapshots
 
@@ -166,7 +174,6 @@ Benchmark output is hardware-dependent. Current benchmark targets cover `apply_f
 
 ## Roadmap
 
-- Multi-currency FX.
 - FIFO/LIFO accounting.
 - Corrections and busts.
 - Python bindings.

@@ -50,6 +50,7 @@ pub struct CanonicalStateV1 {
     pub instruments: Vec<InstrumentMeta>,
     pub positions: Vec<Position>,
     pub marks: Vec<Mark>,
+    pub fx_rates: Vec<FxRate>,
     pub seen_events: Vec<EventId>,
     pub last_seq: u64,
 }
@@ -71,6 +72,7 @@ impl CanonicalStateV1 {
             instruments: engine.instruments.values().cloned().collect(),
             positions: engine.positions.values().cloned().collect(),
             marks: engine.marks.values().cloned().collect(),
+            fx_rates: engine.fx_rates.values().cloned().collect(),
             seen_events: engine.seen_events.iter().copied().collect(),
             last_seq: engine.last_seq,
         }
@@ -104,6 +106,11 @@ impl CanonicalStateV1 {
                 .marks
                 .into_iter()
                 .map(|m| (m.instrument_id, m))
+                .collect(),
+            fx_rates: self
+                .fx_rates
+                .into_iter()
+                .map(|rate| ((rate.from_currency_id, rate.to_currency_id), rate))
                 .collect(),
             seen_events: self.seen_events.into_iter().collect(),
             last_seq: self.last_seq,
@@ -196,8 +203,8 @@ impl Engine {
             return Err(Error::SnapshotValidation("missing base currency"));
         }
         for account in self.accounts.values() {
-            if account.base_currency != self.config.base_currency {
-                return Err(Error::SnapshotValidation("account currency mismatch"));
+            if !self.currencies.contains_key(&account.base_currency) {
+                return Err(Error::SnapshotValidation("account currency missing"));
             }
             if account.cash.currency_id != account.base_currency
                 || account.cash.scale != self.config.account_money_scale
@@ -214,8 +221,16 @@ impl Engine {
             }
         }
         for instrument in self.instruments.values() {
-            if instrument.currency_id != self.config.base_currency {
-                return Err(Error::SnapshotValidation("instrument currency mismatch"));
+            if !self.currencies.contains_key(&instrument.currency_id) {
+                return Err(Error::SnapshotValidation("instrument currency missing"));
+            }
+        }
+        for rate in self.fx_rates.values() {
+            if !self.currencies.contains_key(&rate.from_currency_id)
+                || !self.currencies.contains_key(&rate.to_currency_id)
+                || rate.rate.value <= 0
+            {
+                return Err(Error::SnapshotValidation("invalid fx rate"));
             }
         }
         for position in self.positions.values() {
@@ -232,6 +247,20 @@ impl Engine {
             }
             if position.signed_qty.value != 0 && position.avg_price.is_none() {
                 return Err(Error::SnapshotValidation("open position missing avg price"));
+            }
+            let account = self.accounts.get(&position.key.account_id).unwrap();
+            for money in [
+                position.cost_basis,
+                position.realized_pnl,
+                position.unrealized_pnl,
+                position.gross_exposure,
+                position.net_exposure,
+            ] {
+                if money.currency_id != account.base_currency
+                    || money.scale != self.config.account_money_scale
+                {
+                    return Err(Error::SnapshotValidation("position money invalid"));
+                }
             }
         }
         Ok(())
