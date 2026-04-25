@@ -1,11 +1,10 @@
 use crate::account::AccountState;
 use crate::account_metrics::AccountMetrics;
 use crate::accounting::{
-    apply_average_cost_fill, fill_position_key, revalue_position, AverageCostConfig,
-    AverageCostFillInput, PositionRevaluation,
+    apply_average_cost_fill, fill_position_key, AverageCostConfig, AverageCostFillInput,
 };
 use crate::config::EngineConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::event::{Event, EventKind, Fill, FxRateUpdate, MarkPriceUpdate};
 use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
 use crate::position::{FxRate, Mark, Position, PositionKey};
@@ -14,6 +13,7 @@ use crate::replay_journal::ReplayJournal;
 use crate::snapshot::{CanonicalStateV1, StateHash};
 use crate::summary::{AccountSummary, ApplyResult};
 use crate::types::*;
+use crate::valuation::{self, ValuationConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,6 +107,13 @@ impl Engine {
 
     pub fn state_hash(&self) -> StateHash {
         StateHash::from_canonical(&CanonicalStateV1::from_engine(self))
+    }
+
+    fn valuation_config(&self) -> ValuationConfig {
+        ValuationConfig {
+            account_money_scale: self.config.account_money_scale,
+            rounding_mode: self.config.rounding_mode,
+        }
     }
 
     pub(super) fn apply_accounting_effect(
@@ -215,6 +222,7 @@ impl Engine {
             fill.fee.currency_id,
             self.config.account_money_scale,
         )?;
+        let valuation_config = self.valuation_config();
         let key = fill_position_key(fill);
 
         let position = self.positions.remove(&key);
@@ -232,11 +240,20 @@ impl Engine {
                 },
                 ts_unix_ns,
             },
-            |money, to_currency_id| self.convert_money(money, to_currency_id),
+            |money, to_currency_id| {
+                valuation::convert_money(money, to_currency_id, &self.fx_rates, valuation_config)
+            },
         )?;
         let cash_delta = outcome.cash_delta;
         let realized_delta = outcome.realized_delta;
-        self.revalue_position(&mut outcome.position, &instrument)?;
+        valuation::revalue_position(
+            &mut outcome.position,
+            &instrument,
+            account_currency,
+            self.marks.get(&key.instrument_id),
+            &self.fx_rates,
+            valuation_config,
+        )?;
 
         let account = self.accounts.get_mut(&fill.account_id).unwrap();
         account.cash = account.cash.checked_add(cash_delta)?;
@@ -254,31 +271,29 @@ impl Engine {
         drawdown_accounts: &mut BTreeSet<AccountId>,
     ) -> Result<()> {
         let instrument = self.registry.instrument(mark.instrument_id)?.clone();
-        let price = mark
-            .price
-            .to_scale(instrument.price_scale, self.config.rounding_mode)?;
-        let keys: Vec<_> = self
-            .positions
-            .keys()
-            .copied()
-            .filter(|key| key.instrument_id == mark.instrument_id)
-            .collect();
-        for key in &keys {
-            let account_currency = self.registry.account_currency(key.account_id)?;
-            self.ensure_conversion_rate(instrument.currency_id, account_currency)?;
-        }
+        let valuation_config = self.valuation_config();
+        let normalized_mark =
+            valuation::normalize_mark(mark, &instrument, valuation_config, ts_unix_ns)?;
+        let keys = valuation::positions_affected_by_mark(&self.positions, mark.instrument_id);
+        valuation::ensure_direct_rates_for_positions(
+            &keys,
+            &self.registry,
+            instrument.currency_id,
+            &self.fx_rates,
+        )?;
 
-        self.marks.insert(
-            mark.instrument_id,
-            Mark {
-                instrument_id: mark.instrument_id,
-                price,
-                ts_unix_ns,
-            },
-        );
+        self.marks.insert(mark.instrument_id, normalized_mark);
         for key in keys {
+            let account_currency = self.registry.account_currency(key.account_id)?;
             let mut position = self.positions.remove(&key).unwrap();
-            self.revalue_position(&mut position, &instrument)?;
+            valuation::revalue_position(
+                &mut position,
+                &instrument,
+                account_currency,
+                self.marks.get(&key.instrument_id),
+                &self.fx_rates,
+                valuation_config,
+            )?;
             drawdown_accounts.insert(key.account_id);
             changed_positions.push(key);
             self.positions.insert(key, position);
@@ -295,60 +310,34 @@ impl Engine {
     ) -> Result<()> {
         self.registry.ensure_currency(fx.from_currency_id)?;
         self.registry.ensure_currency(fx.to_currency_id)?;
-        if fx.rate.value <= 0 {
-            return Err(Error::InvalidPrice);
-        }
-        let rate = fx.rate.to_scale(fx.rate.scale, self.config.rounding_mode)?;
-        self.fx_rates.insert(
-            (fx.from_currency_id, fx.to_currency_id),
-            FxRate {
-                from_currency_id: fx.from_currency_id,
-                to_currency_id: fx.to_currency_id,
-                rate,
-                ts_unix_ns,
-            },
-        );
+        let valuation_config = self.valuation_config();
+        let rate = valuation::normalize_fx_rate(fx, valuation_config, ts_unix_ns)?;
+        self.fx_rates
+            .insert((fx.from_currency_id, fx.to_currency_id), rate);
 
-        let keys: Vec<_> = self
-            .positions
-            .keys()
-            .copied()
-            .filter(|key| {
-                self.registry
-                    .instrument(key.instrument_id)
-                    .is_ok_and(|instrument| instrument.currency_id == fx.from_currency_id)
-                    && self
-                        .registry
-                        .account_currency(key.account_id)
-                        .is_ok_and(|currency| currency == fx.to_currency_id)
-            })
-            .collect();
+        let keys = valuation::positions_affected_by_fx_rate(
+            &self.positions,
+            &self.registry,
+            fx.from_currency_id,
+            fx.to_currency_id,
+        );
         for key in keys {
             let instrument = self.registry.instrument(key.instrument_id)?.clone();
+            let account_currency = self.registry.account_currency(key.account_id)?;
             let mut position = self.positions.remove(&key).unwrap();
-            self.revalue_position(&mut position, &instrument)?;
+            valuation::revalue_position(
+                &mut position,
+                &instrument,
+                account_currency,
+                self.marks.get(&key.instrument_id),
+                &self.fx_rates,
+                valuation_config,
+            )?;
             drawdown_accounts.insert(key.account_id);
             changed_positions.push(key);
             self.positions.insert(key, position);
         }
         Ok(())
-    }
-
-    fn revalue_position(&self, position: &mut Position, instrument: &InstrumentMeta) -> Result<()> {
-        let account_currency = self.registry.account_currency(position.key.account_id)?;
-        let valuation_price = self.marks.get(&position.key.instrument_id).map(|m| m.price);
-        revalue_position(
-            position,
-            PositionRevaluation {
-                account_currency,
-                account_money_scale: self.config.account_money_scale,
-                valuation_price,
-                instrument_currency: instrument.currency_id,
-                multiplier: instrument.multiplier,
-                rounding: self.config.rounding_mode,
-            },
-            |money, to_currency_id| self.convert_money(money, to_currency_id),
-        )
     }
 
     pub(super) fn update_drawdown(&mut self, account_id: AccountId) -> Result<()> {
@@ -362,50 +351,5 @@ impl Engine {
             account.max_drawdown = account.current_drawdown;
         }
         Ok(())
-    }
-
-    fn convert_money(&self, money: Money, to_currency_id: CurrencyId) -> Result<Money> {
-        if money.currency_id == to_currency_id {
-            return money_from_components(
-                money.amount,
-                money.scale,
-                to_currency_id,
-                self.config.account_money_scale,
-                self.config.rounding_mode,
-            );
-        }
-        let rate = self
-            .fx_rates
-            .get(&(money.currency_id, to_currency_id))
-            .ok_or(Error::MissingFxRate {
-                from_currency: money.currency_id,
-                to_currency: to_currency_id,
-            })?
-            .rate;
-        convert_money_with_rate(
-            money,
-            to_currency_id,
-            rate,
-            self.config.account_money_scale,
-            self.config.rounding_mode,
-        )
-    }
-
-    fn ensure_conversion_rate(
-        &self,
-        from_currency_id: CurrencyId,
-        to_currency_id: CurrencyId,
-    ) -> Result<()> {
-        if from_currency_id == to_currency_id
-            || self
-                .fx_rates
-                .contains_key(&(from_currency_id, to_currency_id))
-        {
-            return Ok(());
-        }
-        Err(Error::MissingFxRate {
-            from_currency: from_currency_id,
-            to_currency: to_currency_id,
-        })
     }
 }

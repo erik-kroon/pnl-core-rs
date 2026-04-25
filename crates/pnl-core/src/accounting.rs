@@ -3,7 +3,7 @@ use crate::event::Fill;
 use crate::metadata::InstrumentMeta;
 use crate::position::{Position, PositionKey};
 use crate::types::{
-    div_round, value_qty_price_multiplier, CurrencyId, FixedI128, Money, Price, Qty, RoundingMode,
+    div_round, value_qty_price_multiplier, CurrencyId, Money, Price, Qty, RoundingMode,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -205,16 +205,18 @@ fn apply_average_cost_position_fill(
     })
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PositionRevaluation {
     pub(crate) account_currency: CurrencyId,
     pub(crate) account_money_scale: u8,
     pub(crate) valuation_price: Option<Price>,
     pub(crate) instrument_currency: CurrencyId,
-    pub(crate) multiplier: FixedI128,
+    pub(crate) multiplier: crate::types::FixedI128,
     pub(crate) rounding: RoundingMode,
 }
 
+#[cfg(test)]
 pub(crate) fn revalue_position(
     position: &mut Position,
     input: PositionRevaluation,

@@ -1,8 +1,9 @@
 use crate::engine::Engine;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::snapshot::StateHash;
 use crate::summary::AccountSummary;
 use crate::types::*;
+use crate::valuation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccountMetrics {
@@ -29,32 +30,20 @@ impl AccountMetrics {
     pub(crate) fn compute(engine: &Engine, account_id: AccountId) -> Result<Self> {
         engine.registry.ensure_account(account_id)?;
         let account = engine.accounts.get(&account_id).unwrap();
-        let zero = Money::zero(account.base_currency, engine.config.account_money_scale);
-        let mut gross = zero;
-        let mut net = zero;
-        let mut unrealized = zero;
-        let mut open_positions = 0_u32;
+        let totals = valuation::account_position_totals(
+            engine
+                .positions
+                .values()
+                .filter(|p| p.key.account_id == account_id),
+            account.base_currency,
+            engine.config.account_money_scale,
+        )?;
 
-        for position in engine
-            .positions
-            .values()
-            .filter(|p| p.key.account_id == account_id)
-        {
-            if position.signed_qty.value != 0 {
-                open_positions = open_positions
-                    .checked_add(1)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            }
-            gross = gross.checked_add(position.gross_exposure)?;
-            net = net.checked_add(position.net_exposure)?;
-            unrealized = unrealized.checked_add(position.unrealized_pnl)?;
-        }
-
-        let equity = account.cash.checked_add(net)?;
-        let total_pnl = account.realized_pnl.checked_add(unrealized)?;
+        let equity = account.cash.checked_add(totals.position_market_value)?;
+        let total_pnl = account.realized_pnl.checked_add(totals.unrealized_pnl)?;
         let leverage = if equity.amount > 0 {
             Some(Ratio::from_fraction(
-                gross.amount,
+                totals.gross_exposure.amount,
                 equity.amount,
                 ACCOUNT_RATIO_SCALE,
                 engine.config.rounding_mode,
@@ -71,18 +60,18 @@ impl AccountMetrics {
             account_id,
             base_currency: account.base_currency,
             cash: account.cash,
-            position_market_value: net,
+            position_market_value: totals.position_market_value,
             equity,
             realized_pnl: account.realized_pnl,
-            unrealized_pnl: unrealized,
+            unrealized_pnl: totals.unrealized_pnl,
             total_pnl,
-            gross_exposure: gross,
-            net_exposure: net,
+            gross_exposure: totals.gross_exposure,
+            net_exposure: totals.net_exposure,
             leverage,
             peak_equity: account.peak_equity,
             current_drawdown: account.current_drawdown,
             max_drawdown: account.max_drawdown,
-            open_positions,
+            open_positions: totals.open_positions,
             net_external_cash_flows: account.net_external_cash_flows,
             pnl_reconciliation_delta,
         })
