@@ -1,5 +1,9 @@
 use crate::account::AccountState;
-use crate::accounting::{apply_average_cost_fill, AverageCostFill};
+use crate::account_metrics::AccountMetrics;
+use crate::accounting::{
+    apply_average_cost_fill, fill_position_key, revalue_position, AverageCostConfig,
+    AverageCostFillInput, PositionRevaluation,
+};
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
 use crate::event::{Event, EventKind, Fill, FxRateUpdate, MarkPriceUpdate};
@@ -108,63 +112,7 @@ impl Engine {
     }
 
     pub fn account_summary(&self, account_id: AccountId) -> Result<AccountSummary> {
-        self.ensure_account(account_id)?;
-        let account = self.accounts.get(&account_id).unwrap();
-        let zero = Money::zero(account.base_currency, self.config.account_money_scale);
-        let mut gross = zero;
-        let mut net = zero;
-        let mut unrealized = zero;
-        let mut open_positions = 0_u32;
-        for position in self
-            .positions
-            .values()
-            .filter(|p| p.key.account_id == account_id)
-        {
-            if position.signed_qty.value != 0 {
-                open_positions = open_positions
-                    .checked_add(1)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            }
-            gross = gross.checked_add(position.gross_exposure)?;
-            net = net.checked_add(position.net_exposure)?;
-            unrealized = unrealized.checked_add(position.unrealized_pnl)?;
-        }
-        let equity = account.cash.checked_add(net)?;
-        let total_pnl = account.realized_pnl.checked_add(unrealized)?;
-        let leverage = if equity.amount > 0 {
-            Some(Ratio::from_fraction(
-                gross.amount,
-                equity.amount,
-                ACCOUNT_RATIO_SCALE,
-                self.config.rounding_mode,
-            )?)
-        } else {
-            None
-        };
-        let expected_pnl = equity
-            .checked_sub(account.initial_cash)?
-            .checked_sub(account.net_external_cash_flows)?;
-        let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
-        Ok(AccountSummary {
-            account_id,
-            base_currency: account.base_currency,
-            cash: account.cash,
-            position_market_value: net,
-            equity,
-            realized_pnl: account.realized_pnl,
-            unrealized_pnl: unrealized,
-            total_pnl,
-            gross_exposure: gross,
-            net_exposure: net,
-            leverage,
-            peak_equity: account.peak_equity,
-            current_drawdown: account.current_drawdown,
-            max_drawdown: account.max_drawdown,
-            open_positions,
-            net_external_cash_flows: account.net_external_cash_flows,
-            pnl_reconciliation_delta,
-            state_hash: self.state_hash(),
-        })
+        Ok(AccountMetrics::compute(self, account_id)?.into_summary(self.state_hash()))
     }
 
     pub fn state_hash(&self) -> StateHash {
@@ -263,53 +211,24 @@ impl Engine {
         let instrument = self.ensure_instrument(fill.instrument_id)?.clone();
         let account_currency = self.accounts.get(&fill.account_id).unwrap().base_currency;
         self.ensure_money(fill.fee, fill.fee.currency_id)?;
-        let fee = self.convert_money(fill.fee, account_currency)?;
-        let qty = fill.qty.to_scale_exact(instrument.qty_scale)?;
-        if qty.value <= 0 {
-            return Err(Error::InvalidQuantity);
-        }
-        let price = fill
-            .price
-            .to_scale(instrument.price_scale, self.config.rounding_mode)?;
-
-        let signed_delta = qty
-            .value
-            .checked_mul(fill.side.sign())
-            .ok_or(Error::ArithmeticOverflow)?;
-        let key = PositionKey {
-            account_id: fill.account_id,
-            book_id: fill.book_id,
-            instrument_id: fill.instrument_id,
-        };
+        let key = fill_position_key(fill);
 
         let position = self.positions.remove(&key);
         let mut outcome = apply_average_cost_fill(
-            position,
-            AverageCostFill {
-                key,
-                qty,
-                signed_delta,
-                price,
-                fee,
-                account_money_scale: self.config.account_money_scale,
-                price_scale: instrument.price_scale,
-                rounding: self.config.rounding_mode,
-                allow_short: self.config.allow_short,
-                allow_position_flip: self.config.allow_position_flip,
+            AverageCostFillInput {
+                position,
+                fill,
+                instrument: &instrument,
+                account_currency,
+                config: AverageCostConfig {
+                    account_money_scale: self.config.account_money_scale,
+                    rounding: self.config.rounding_mode,
+                    allow_short: self.config.allow_short,
+                    allow_position_flip: self.config.allow_position_flip,
+                },
                 ts_unix_ns,
             },
-            |signed_qty| {
-                let trade_value = value_qty_price_multiplier(
-                    signed_qty,
-                    qty.scale,
-                    price,
-                    instrument.multiplier,
-                    instrument.currency_id,
-                    self.config.account_money_scale,
-                    self.config.rounding_mode,
-                )?;
-                self.convert_money(trade_value, account_currency)
-            },
+            |money, to_currency_id| self.convert_money(money, to_currency_id),
         )?;
         let cash_delta = outcome.cash_delta;
         let realized_delta = outcome.realized_delta;
@@ -320,7 +239,7 @@ impl Engine {
         account.realized_pnl = account.realized_pnl.checked_add(realized_delta)?;
 
         self.positions.insert(key, outcome.position);
-        Ok((key, cash_delta, realized_delta))
+        Ok((outcome.key, cash_delta, realized_delta))
     }
 
     fn apply_mark(
@@ -418,104 +337,32 @@ impl Engine {
             .get(&position.key.account_id)
             .ok_or(Error::UnknownAccount(position.key.account_id))?
             .base_currency;
-        let zero = Money::zero(account_currency, self.config.account_money_scale);
-        if position.signed_qty.value == 0 {
-            position.unrealized_pnl = zero;
-            position.gross_exposure = zero;
-            position.net_exposure = zero;
-            return Ok(());
-        }
         let valuation_price = self.marks.get(&position.key.instrument_id).map(|m| m.price);
-        position.net_exposure = if let Some(valuation_price) = valuation_price {
-            let exposure = value_qty_price_multiplier(
-                position.signed_qty.value,
-                position.signed_qty.scale,
+        revalue_position(
+            position,
+            PositionRevaluation {
+                account_currency,
+                account_money_scale: self.config.account_money_scale,
                 valuation_price,
-                instrument.multiplier,
-                instrument.currency_id,
-                self.config.account_money_scale,
-                self.config.rounding_mode,
-            )?;
-            self.convert_money(exposure, account_currency)?
-        } else {
-            position.cost_basis
-        };
-        position.gross_exposure = position.net_exposure.abs();
-        position.unrealized_pnl = position.net_exposure.checked_sub(position.cost_basis)?;
-        Ok(())
+                instrument_currency: instrument.currency_id,
+                multiplier: instrument.multiplier,
+                rounding: self.config.rounding_mode,
+            },
+            |money, to_currency_id| self.convert_money(money, to_currency_id),
+        )
     }
 
     pub(super) fn update_drawdown(&mut self, account_id: AccountId) -> Result<()> {
-        let summary = self.account_summary_without_hash(account_id)?;
+        let equity = AccountMetrics::compute(self, account_id)?.equity();
         let account = self.accounts.get_mut(&account_id).unwrap();
-        if !account.initial_cash_set || summary.equity.amount > account.peak_equity.amount {
-            account.peak_equity = summary.equity;
+        if !account.initial_cash_set || equity.amount > account.peak_equity.amount {
+            account.peak_equity = equity;
         }
-        account.current_drawdown = summary.equity.checked_sub(account.peak_equity)?;
+        account.current_drawdown = equity.checked_sub(account.peak_equity)?;
         if account.current_drawdown.amount < account.max_drawdown.amount {
             account.max_drawdown = account.current_drawdown;
         }
         Ok(())
-    }
-
-    fn account_summary_without_hash(&self, account_id: AccountId) -> Result<AccountSummary> {
-        self.ensure_account(account_id)?;
-        let account = self.accounts.get(&account_id).unwrap();
-        let zero = Money::zero(account.base_currency, self.config.account_money_scale);
-        let mut gross = zero;
-        let mut net = zero;
-        let mut unrealized = zero;
-        let mut open_positions = 0_u32;
-        for position in self
-            .positions
-            .values()
-            .filter(|p| p.key.account_id == account_id)
-        {
-            if position.signed_qty.value != 0 {
-                open_positions = open_positions
-                    .checked_add(1)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            }
-            gross = gross.checked_add(position.gross_exposure)?;
-            net = net.checked_add(position.net_exposure)?;
-            unrealized = unrealized.checked_add(position.unrealized_pnl)?;
-        }
-        let equity = account.cash.checked_add(net)?;
-        let total_pnl = account.realized_pnl.checked_add(unrealized)?;
-        let leverage = if equity.amount > 0 {
-            Some(Ratio::from_fraction(
-                gross.amount,
-                equity.amount,
-                ACCOUNT_RATIO_SCALE,
-                self.config.rounding_mode,
-            )?)
-        } else {
-            None
-        };
-        let expected_pnl = equity
-            .checked_sub(account.initial_cash)?
-            .checked_sub(account.net_external_cash_flows)?;
-        let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
-        Ok(AccountSummary {
-            account_id,
-            base_currency: account.base_currency,
-            cash: account.cash,
-            position_market_value: net,
-            equity,
-            realized_pnl: account.realized_pnl,
-            unrealized_pnl: unrealized,
-            total_pnl,
-            gross_exposure: gross,
-            net_exposure: net,
-            leverage,
-            peak_equity: account.peak_equity,
-            current_drawdown: account.current_drawdown,
-            max_drawdown: account.max_drawdown,
-            open_positions,
-            net_external_cash_flows: account.net_external_cash_flows,
-            pnl_reconciliation_delta,
-            state_hash: StateHash::zero(),
-        })
     }
 
     fn ensure_currency(&self, currency_id: CurrencyId) -> Result<()> {
