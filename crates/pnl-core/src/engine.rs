@@ -10,7 +10,7 @@ use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
 use crate::position::{FxRate, Mark, Position, PositionKey};
 use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
-use crate::snapshot::{CanonicalStateV1, StateHash};
+use crate::state_hash::{hash_engine_state, StateHash};
 use crate::summary::{AccountSummary, ApplyResult};
 use crate::types::*;
 use crate::valuation::{self, ValuationConfig};
@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 mod accounting_effect {
     use crate::position::PositionKey;
-    use crate::snapshot::StateHash;
+    use crate::state_hash::StateHash;
     use crate::summary::ApplyResult;
     use crate::types::{AccountId, Money};
     use std::collections::BTreeSet;
@@ -179,7 +179,7 @@ impl Engine {
     }
 
     pub fn state_hash(&self) -> StateHash {
-        StateHash::from_canonical(&CanonicalStateV1::from_engine(self))
+        hash_engine_state(self)
     }
 
     fn valuation_config(&self) -> ValuationConfig {
