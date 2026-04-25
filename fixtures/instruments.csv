@@ -1,0 +1,4 @@
+instrument_id,symbol,currency,price_scale,qty_scale,multiplier
+1,AAPL,USD,4,0,1
+2,ESZ5,USD,2,0,50
+
