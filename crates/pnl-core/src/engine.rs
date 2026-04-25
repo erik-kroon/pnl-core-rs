@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 mod accounting_effect {
     use crate::position::PositionKey;
-    use crate::snapshot::StateHash;
+    use crate::state_hash::StateHash;
     use crate::summary::ApplyResult;
     use crate::types::{AccountId, Money};
     use std::collections::BTreeSet;
