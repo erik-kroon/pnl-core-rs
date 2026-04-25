@@ -1,26 +1,38 @@
 # pnl-core-rs
 
-Deterministic fixed-point PnL, position, and exposure accounting for real-time trading systems.
+Deterministic fixed-point PnL, position, exposure, equity, leverage, drawdown,
+snapshot, and replay accounting for real-time trading systems.
 
-`pnl-core-rs` turns strict ordered accounting events into replayable portfolio state: cash, positions, realized PnL, unrealized PnL, exposure, equity, leverage, drawdown, snapshots, and deterministic state hashes.
+`pnl-core-rs` consumes a strict ordered stream of accounting events and produces
+replayable portfolio state. The core crate is intentionally small and
+cash-authoritative: cash is the source of truth, equity is derived, and all
+public state can be snapshotted, restored, and hashed deterministically.
 
-## V1 Scope
+## Status
 
-V1 is intentionally narrow:
+This repository contains the V1 Rust implementation:
 
-- Rust-only core crate plus a replay CLI.
-- Multi-currency instruments and accounts with direct FX conversion into each account currency.
+- `crates/pnl-core`: accounting engine and public Rust interface.
+- `crates/pnl-cli`: replay CLI for TOML, CSV, and NDJSON inputs.
+- `fixtures/`: sample configuration, instruments, and events.
+
+The crate is not a broker connector, order management system, strategy runtime,
+or settlement engine.
+
+## What V1 Supports
+
+- Strict contiguous event replay.
 - Typed IDs for accounts, books, instruments, currencies, and events.
+- Account and instrument registry validation.
 - Cash-authoritative accounting.
 - Average-cost position accounting.
-- Account summaries with gross exposure, net exposure, equity, leverage, open-position count, drawdown, and reconciliation delta.
+- Multi-currency instruments and accounts with explicit direct FX conversion.
+- Fill fees, including rebates and non-account-currency fees.
+- Marks, FX revaluation, gross/net exposure, unrealized PnL, and leverage.
 - Trade corrections and busts through deterministic historical replay.
-- Fixed-point `i128` arithmetic with account money scale `4`.
-- Strict contiguous event replay.
-- Versioned `.pnlsnap` snapshot/restore.
-- Public deterministic `state_hash()`.
-
-Not included in v1: FIFO/LIFO, Python/C/WASM bindings, Arrow/Parquet export, broker connectors, order management, or strategy logic.
+- Versioned binary `.pnlsnap` snapshot/restore.
+- JSON snapshot export for inspection and golden tests.
+- Deterministic `state_hash()` over canonical accounting state.
 
 ## Core Invariants
 
@@ -28,30 +40,14 @@ Not included in v1: FIFO/LIFO, Python/C/WASM bindings, Arrow/Parquet export, bro
 - Equity is always derived as `cash + position_market_value`.
 - Replay is strict and contiguous by sequence number.
 - Duplicate event IDs are rejected.
-- Average-cost accounting is the only v1 accounting method.
-- State hash is deterministic over canonical accounting state.
-- Snapshots encode canonical state, not raw engine internals.
+- Average-cost accounting is the only V1 accounting method.
+- FX conversion uses explicit direct rates only.
+- Snapshots encode canonical state, not raw implementation internals.
+- State hashes are deterministic fingerprints, not cryptographic audit proofs.
 
-## Known Limitations
+## Quickstart
 
-- FX uses explicit direct rates only; inverse and cross-rate routing are not inferred.
-- Average-cost accounting only.
-- Currency metadata must use the configured account money scale.
-- No FIFO/LIFO lots.
-- Corrections and busts can only target prior fill events and corrections must keep the original account, book, and instrument.
-- No settlement model.
-- No dividends, funding payments, or borrow fees.
-- State hash is a deterministic fingerprint, not a cryptographic audit proof.
-
-## Workspace
-
-```text
-crates/pnl-core  # accounting engine
-crates/pnl-cli   # replay CLI, binary name: pnl-core
-fixtures/        # sample config, instruments, and events
-```
-
-## CLI Demo
+Run the sample replay:
 
 ```bash
 cargo run -p pnl-cli -- replay \
@@ -63,13 +59,18 @@ cargo run -p pnl-cli -- replay \
   --state-hash
 ```
 
-Snapshot output is available with:
+Write binary and JSON snapshots:
 
 ```bash
---snapshot-out state.pnlsnap --snapshot-json-out state.snapshot.json
+cargo run -p pnl-cli -- replay \
+  --config fixtures/config.toml \
+  --instruments fixtures/instruments.csv \
+  --events fixtures/events.ndjson \
+  --snapshot-out state.pnlsnap \
+  --snapshot-json-out state.snapshot.json
 ```
 
-## Core API Sketch
+## Rust API Sketch
 
 ```rust
 use pnl_core::*;
@@ -114,30 +115,33 @@ println!("{summary:?}");
 # Ok::<(), pnl_core::Error>(())
 ```
 
-## Accounting Notes
+## Accounting Model
 
-- Cash is source of truth.
-- Equity is derived as `cash + position_market_value`.
-- Positive fee means cost.
-- Negative fee means rebate.
-- Fees are converted into account currency before cash and realized PnL updates.
-- Fees reduce cash immediately.
-- Fees are recognized immediately in realized PnL.
-- Fees are not capitalized into average price.
-- Position cost basis is tracked separately from rounded average price so summaries reconcile under fixed-point rounding.
-- If no mark is available, position market value uses signed cost basis and unrealized PnL is zero.
-- Once a mark is available, unrealized PnL is account-currency `marked_market_value - signed_cost_basis`.
+V1 uses average-cost accounting. Fees are converted into account currency before
+cash and realized PnL updates. Positive fees are costs; negative fees are
+rebates. Fees reduce or increase cash immediately and are recognized immediately
+in realized PnL. Fees are not capitalized into average price.
+
+Position cost basis is tracked separately from rounded average price so account
+summaries reconcile under fixed-point rounding. If no mark is available,
+position market value uses signed cost basis and unrealized PnL is zero. Once a
+mark is available, unrealized PnL is:
+
+```text
+marked_market_value - signed_cost_basis
+```
 
 ## Replay Contract
 
-Events must be pre-ordered and deduplicated.
+Events must be pre-ordered by `seq`.
 
 - `seq` must start at `expected_start_seq`, default `1`.
 - Each next event must use `last_seq + 1`.
-- `event_id` must be unique. The CLI defaults `event_id` to `seq` when omitted.
-- Timestamps are informational in v1.
+- `event_id` must be unique.
+- The CLI defaults `event_id` to `seq` when omitted.
+- `ts_unix_ns` is recorded but informational in V1.
 
-Supported event types are:
+Supported event types:
 
 - `initial_cash`
 - `cash_adjustment`
@@ -147,38 +151,98 @@ Supported event types are:
 - `trade_correction`
 - `trade_bust`
 
-An `fx_rate` event supplies a direct conversion rate as target currency units per one source currency unit:
+An `fx_rate` event supplies target currency units per one source currency unit:
 
 ```json
 {"seq":2,"type":"fx_rate","from_currency":"EUR","to_currency":"USD","rate":"1.10","ts_unix_ns":2}
 ```
 
-Cross-currency fills, fees, and marked exposures require a direct rate from the source currency to the account currency unless both currencies are the same. Fill fees default to the config `base_currency`; set `fee_currency` on fill events when the fee is charged in another currency.
+Cross-currency fills, fees, and marked exposures require a direct rate from the
+source currency to the account currency unless both currencies are the same.
+Inverse and cross-rate routing are not inferred.
 
-A `trade_correction` replaces a prior fill, then the engine replays later events from the retained event journal:
+Corrections and busts target prior fill events:
 
 ```json
 {"seq":4,"type":"trade_correction","original_event_id":2,"account_id":1,"book_id":1,"instrument_id":1,"side":"buy","qty":"100","price":"9.00","fee":"0","ts_unix_ns":4}
-```
-
-A `trade_bust` removes a prior fill and replays later events:
-
-```json
 {"seq":5,"type":"trade_bust","original_event_id":2,"reason":"venue bust","ts_unix_ns":5}
 ```
 
-Corrections and busts must target a prior `fill` event. A correction may adjust side, quantity, price, or fee, but must keep the same account, book, and instrument as the original fill.
+A correction may change side, quantity, price, or fee, but must keep the original
+account, book, and instrument. The engine retains the accepted event journal and
+rebuilds canonical accounting state deterministically after corrections and
+busts.
+
+## CLI Inputs
+
+Configuration is TOML:
+
+```toml
+base_currency = "USD"
+account_money_scale = 4
+allow_short = true
+allow_position_flip = true
+expected_start_seq = 1
+
+[[accounts]]
+account_id = 1
+
+[[books]]
+account_id = 1
+book_id = 1
+```
+
+Instruments are CSV:
+
+```csv
+instrument_id,symbol,currency,price_scale,qty_scale,multiplier
+1,AAPL,USD,4,0,1
+```
+
+Events are newline-delimited JSON:
+
+```json
+{"seq":1,"type":"initial_cash","account_id":1,"currency":"USD","amount":"100000.00","ts_unix_ns":1}
+{"seq":2,"type":"fill","account_id":1,"book_id":1,"instrument_id":1,"side":"buy","qty":"100","price":"185.00","fee":"1.00","ts_unix_ns":2}
+{"seq":3,"type":"mark","instrument_id":1,"price":"187.50","ts_unix_ns":3}
+```
 
 ## Snapshots
 
-Production snapshots use:
+Binary snapshots use:
 
-- magic header `PNLRS001`
-- format version `1`
-- Postcard/Serde payload
-- BLAKE3 payload hash
+- Magic header `PNLRS001`.
+- Format version `1`.
+- Postcard/Serde payload.
+- BLAKE3 payload hash.
 
-The payload stores canonical accounting state, not raw implementation internals. JSON snapshot export is intended for debugging, golden tests, and review. Snapshots retain the accepted event journal so restored engines can apply later corrections and busts.
+Snapshots retain the accepted event journal, so restored engines can apply later
+trade corrections and busts.
+
+## Internal Layout
+
+The codebase is split around the main accounting seams:
+
+- `engine`: orchestration and public engine methods.
+- `registry`: account, book, currency, and instrument metadata validation.
+- `accounting`: average-cost fill accounting.
+- `valuation`: FX conversion, mark valuation, exposure, and unrealized PnL.
+- `account_metrics`: account summaries, equity, leverage, drawdown inputs, and reconciliation.
+- `replay_journal`: event order, duplicate detection, corrections, busts, and rebuild.
+- `state_hash`: canonical state and deterministic hashing.
+- `snapshot`: snapshot conversion, binary codec, and restore validation.
+- `pnl-cli/input.rs`: CLI config, instrument, and event adapters.
+
+## Known Limitations
+
+- Direct FX rates only; inverse and cross rates are not inferred.
+- Average-cost accounting only.
+- No FIFO/LIFO lots.
+- No settlement model.
+- No dividends, funding payments, borrow fees, or financing.
+- No broker connectors, order management, or strategy logic.
+- No Python, C, or WASM bindings in V1.
+- No Arrow or Parquet export in V1.
 
 ## Validation
 
@@ -188,13 +252,14 @@ cargo test --workspace
 cargo bench -p pnl-core
 ```
 
-Benchmark output is hardware-dependent. Current benchmark targets cover `apply_fill`, `apply_mark`, `replay_1k_events`, and `snapshot_restore`.
+Benchmark output is hardware-dependent. Current benchmark targets cover
+`apply_fill`, `apply_mark`, `replay_1k_events`, and `snapshot_restore`.
 
 ## Roadmap
 
 - FIFO/LIFO accounting.
+- Explain APIs and reconciliation reports.
 - Python bindings.
 - C ABI.
 - WASM package.
 - Arrow/Parquet export.
-- Explain APIs and reconciliation reports.
