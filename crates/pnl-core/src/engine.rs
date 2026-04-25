@@ -1,230 +1,27 @@
+use crate::account::AccountState;
 use crate::account_metrics::AccountMetrics;
 use crate::accounting::{
     apply_average_cost_fill, fill_position_key, AverageCostConfig, AverageCostFillInput,
 };
-use crate::error::{Error, Result};
+use crate::config::EngineConfig;
+use crate::error::Result;
+use crate::event::{Event, EventKind, Fill, FxRateUpdate, MarkPriceUpdate};
+use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
+use crate::position::{FxRate, Mark, Position, PositionKey};
+use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
 use crate::snapshot::{CanonicalStateV1, StateHash};
+use crate::summary::{AccountSummary, ApplyResult};
 use crate::types::*;
 use crate::valuation::{self, ValuationConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineConfig {
-    pub base_currency: CurrencyId,
-    pub account_money_scale: u8,
-    pub rounding_mode: RoundingMode,
-    pub accounting_method: AccountingMethod,
-    pub cash_authoritative: bool,
-    pub allow_short: bool,
-    pub allow_position_flip: bool,
-    pub expected_start_seq: u64,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            base_currency: CurrencyId::usd(),
-            account_money_scale: ACCOUNT_MONEY_SCALE,
-            rounding_mode: RoundingMode::HalfEven,
-            accounting_method: AccountingMethod::AverageCost,
-            cash_authoritative: true,
-            allow_short: true,
-            allow_position_flip: true,
-            expected_start_seq: 1,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CurrencyMeta {
-    pub currency_id: CurrencyId,
-    pub code: String,
-    pub scale: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountMeta {
-    pub account_id: AccountId,
-    pub base_currency: CurrencyId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BookMeta {
-    pub account_id: AccountId,
-    pub book_id: BookId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InstrumentMeta {
-    pub instrument_id: InstrumentId,
-    pub symbol: String,
-    pub currency_id: CurrencyId,
-    pub price_scale: u8,
-    pub qty_scale: u8,
-    pub multiplier: FixedI128,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PositionKey {
-    pub account_id: AccountId,
-    pub book_id: BookId,
-    pub instrument_id: InstrumentId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Position {
-    pub key: PositionKey,
-    pub signed_qty: Qty,
-    pub avg_price: Option<Price>,
-    pub cost_basis: Money,
-    pub realized_pnl: Money,
-    pub unrealized_pnl: Money,
-    pub gross_exposure: Money,
-    pub net_exposure: Money,
-    pub opened_at_unix_ns: Option<i64>,
-    pub updated_at_unix_ns: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Mark {
-    pub instrument_id: InstrumentId,
-    pub price: Price,
-    pub ts_unix_ns: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FxRate {
-    pub from_currency_id: CurrencyId,
-    pub to_currency_id: CurrencyId,
-    pub rate: Price,
-    pub ts_unix_ns: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountState {
-    pub account_id: AccountId,
-    pub base_currency: CurrencyId,
-    pub initial_cash: Money,
-    pub cash: Money,
-    pub net_external_cash_flows: Money,
-    pub realized_pnl: Money,
-    pub peak_equity: Money,
-    pub current_drawdown: Money,
-    pub max_drawdown: Money,
-    pub initial_cash_set: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Event {
-    pub seq: u64,
-    pub event_id: EventId,
-    pub ts_unix_ns: i64,
-    pub kind: EventKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EventKind {
-    InitialCash(InitialCash),
-    CashAdjustment(CashAdjustment),
-    Fill(Fill),
-    Mark(MarkPriceUpdate),
-    FxRate(FxRateUpdate),
-    TradeCorrection(TradeCorrection),
-    TradeBust(TradeBust),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InitialCash {
-    pub account_id: AccountId,
-    pub currency_id: CurrencyId,
-    pub amount: Money,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CashAdjustment {
-    pub account_id: AccountId,
-    pub currency_id: CurrencyId,
-    pub amount: Money,
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Fill {
-    pub account_id: AccountId,
-    pub book_id: BookId,
-    pub instrument_id: InstrumentId,
-    pub side: Side,
-    pub qty: Qty,
-    pub price: Price,
-    pub fee: Money,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TradeCorrection {
-    pub original_event_id: EventId,
-    pub replacement: Fill,
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TradeBust {
-    pub original_event_id: EventId,
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MarkPriceUpdate {
-    pub instrument_id: InstrumentId,
-    pub price: Price,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FxRateUpdate {
-    pub from_currency_id: CurrencyId,
-    pub to_currency_id: CurrencyId,
-    pub rate: Price,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApplyResult {
-    pub sequence: u64,
-    pub changed_positions: Vec<PositionKey>,
-    pub realized_pnl_delta: Money,
-    pub cash_delta: Money,
-    pub state_hash: StateHash,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountSummary {
-    pub account_id: AccountId,
-    pub base_currency: CurrencyId,
-    pub cash: Money,
-    pub position_market_value: Money,
-    pub equity: Money,
-    pub realized_pnl: Money,
-    pub unrealized_pnl: Money,
-    pub total_pnl: Money,
-    pub gross_exposure: Money,
-    pub net_exposure: Money,
-    pub leverage: Option<Ratio>,
-    pub peak_equity: Money,
-    pub current_drawdown: Money,
-    pub max_drawdown: Money,
-    pub open_positions: u32,
-    pub net_external_cash_flows: Money,
-    pub pnl_reconciliation_delta: Money,
-    pub state_hash: StateHash,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Engine {
     pub(crate) config: EngineConfig,
-    pub(crate) currencies: BTreeMap<CurrencyId, CurrencyMeta>,
+    pub(crate) registry: Registry,
     pub(crate) accounts: BTreeMap<AccountId, AccountState>,
-    pub(crate) books: BTreeSet<(AccountId, BookId)>,
-    pub(crate) instruments: BTreeMap<InstrumentId, InstrumentMeta>,
     pub(crate) positions: BTreeMap<PositionKey, Position>,
     pub(crate) marks: BTreeMap<InstrumentId, Mark>,
     pub(crate) fx_rates: BTreeMap<(CurrencyId, CurrencyId), FxRate>,
@@ -235,10 +32,8 @@ impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
-            currencies: BTreeMap::new(),
+            registry: Registry::new(),
             accounts: BTreeMap::new(),
-            books: BTreeSet::new(),
-            instruments: BTreeMap::new(),
             positions: BTreeMap::new(),
             marks: BTreeMap::new(),
             fx_rates: BTreeMap::new(),
@@ -255,15 +50,15 @@ impl Engine {
     }
 
     pub fn register_currency(&mut self, meta: CurrencyMeta) -> Result<()> {
-        if meta.scale != self.config.account_money_scale {
-            return Err(Error::InvalidScale);
-        }
-        self.currencies.insert(meta.currency_id, meta);
-        Ok(())
+        self.registry
+            .register_currency(meta, self.config.account_money_scale)
     }
 
     pub fn register_account(&mut self, meta: AccountMeta) -> Result<()> {
-        self.ensure_currency(meta.base_currency)?;
+        let inserted = self.registry.register_account(meta.clone())?;
+        if !inserted {
+            return Ok(());
+        }
         let zero = Money::zero(meta.base_currency, self.config.account_money_scale);
         self.accounts.insert(
             meta.account_id,
@@ -284,18 +79,11 @@ impl Engine {
     }
 
     pub fn register_book(&mut self, meta: BookMeta) -> Result<()> {
-        self.ensure_account(meta.account_id)?;
-        self.books.insert((meta.account_id, meta.book_id));
-        Ok(())
+        self.registry.register_book(meta)
     }
 
     pub fn register_instrument(&mut self, meta: InstrumentMeta) -> Result<()> {
-        self.ensure_currency(meta.currency_id)?;
-        if meta.multiplier.value <= 0 {
-            return Err(Error::InvalidScale);
-        }
-        self.instruments.insert(meta.instrument_id, meta);
-        Ok(())
+        self.registry.register_instrument(meta)
     }
 
     pub fn apply_many(
@@ -341,9 +129,14 @@ impl Engine {
 
         match kind {
             EventKind::InitialCash(initial) => {
-                self.ensure_account(initial.account_id)?;
-                self.ensure_money(initial.amount, initial.currency_id)?;
-                self.ensure_account_currency(initial.account_id, initial.currency_id)?;
+                self.registry.ensure_account(initial.account_id)?;
+                self.registry.ensure_money(
+                    initial.amount,
+                    initial.currency_id,
+                    self.config.account_money_scale,
+                )?;
+                self.registry
+                    .ensure_account_currency(initial.account_id, initial.currency_id)?;
                 let account = self.accounts.get_mut(&initial.account_id).unwrap();
                 let delta = initial.amount.checked_sub(account.cash)?;
                 account.initial_cash = initial.amount;
@@ -353,9 +146,14 @@ impl Engine {
                 drawdown_accounts.insert(initial.account_id);
             }
             EventKind::CashAdjustment(adj) => {
-                self.ensure_account(adj.account_id)?;
-                self.ensure_money(adj.amount, adj.currency_id)?;
-                self.ensure_account_currency(adj.account_id, adj.currency_id)?;
+                self.registry.ensure_account(adj.account_id)?;
+                self.registry.ensure_money(
+                    adj.amount,
+                    adj.currency_id,
+                    self.config.account_money_scale,
+                )?;
+                self.registry
+                    .ensure_account_currency(adj.account_id, adj.currency_id)?;
                 let account = self.accounts.get_mut(&adj.account_id).unwrap();
                 account.cash = account.cash.checked_add(adj.amount)?;
                 account.net_external_cash_flows =
@@ -415,11 +213,15 @@ impl Engine {
     }
 
     fn apply_fill(&mut self, fill: &Fill, ts_unix_ns: i64) -> Result<(PositionKey, Money, Money)> {
-        self.ensure_account(fill.account_id)?;
-        self.ensure_book(fill.account_id, fill.book_id)?;
-        let instrument = self.ensure_instrument(fill.instrument_id)?.clone();
-        let account_currency = self.accounts.get(&fill.account_id).unwrap().base_currency;
-        self.ensure_money(fill.fee, fill.fee.currency_id)?;
+        self.registry.ensure_account(fill.account_id)?;
+        self.registry.ensure_book(fill.account_id, fill.book_id)?;
+        let instrument = self.registry.instrument(fill.instrument_id)?.clone();
+        let account_currency = self.registry.account_currency(fill.account_id)?;
+        self.registry.ensure_money(
+            fill.fee,
+            fill.fee.currency_id,
+            self.config.account_money_scale,
+        )?;
         let valuation_config = self.valuation_config();
         let key = fill_position_key(fill);
 
@@ -468,21 +270,21 @@ impl Engine {
         changed_positions: &mut Vec<PositionKey>,
         drawdown_accounts: &mut BTreeSet<AccountId>,
     ) -> Result<()> {
-        let instrument = self.ensure_instrument(mark.instrument_id)?.clone();
+        let instrument = self.registry.instrument(mark.instrument_id)?.clone();
         let valuation_config = self.valuation_config();
         let normalized_mark =
             valuation::normalize_mark(mark, &instrument, valuation_config, ts_unix_ns)?;
         let keys = valuation::positions_affected_by_mark(&self.positions, mark.instrument_id);
         valuation::ensure_direct_rates_for_positions(
             &keys,
-            &self.accounts,
+            &self.registry,
             instrument.currency_id,
             &self.fx_rates,
         )?;
 
         self.marks.insert(mark.instrument_id, normalized_mark);
         for key in keys {
-            let account_currency = self.accounts.get(&key.account_id).unwrap().base_currency;
+            let account_currency = self.registry.account_currency(key.account_id)?;
             let mut position = self.positions.remove(&key).unwrap();
             valuation::revalue_position(
                 &mut position,
@@ -506,8 +308,8 @@ impl Engine {
         changed_positions: &mut Vec<PositionKey>,
         drawdown_accounts: &mut BTreeSet<AccountId>,
     ) -> Result<()> {
-        self.ensure_currency(fx.from_currency_id)?;
-        self.ensure_currency(fx.to_currency_id)?;
+        self.registry.ensure_currency(fx.from_currency_id)?;
+        self.registry.ensure_currency(fx.to_currency_id)?;
         let valuation_config = self.valuation_config();
         let rate = valuation::normalize_fx_rate(fx, valuation_config, ts_unix_ns)?;
         self.fx_rates
@@ -515,14 +317,13 @@ impl Engine {
 
         let keys = valuation::positions_affected_by_fx_rate(
             &self.positions,
-            &self.instruments,
-            &self.accounts,
+            &self.registry,
             fx.from_currency_id,
             fx.to_currency_id,
         );
         for key in keys {
-            let instrument = self.instruments.get(&key.instrument_id).unwrap().clone();
-            let account_currency = self.accounts.get(&key.account_id).unwrap().base_currency;
+            let instrument = self.registry.instrument(key.instrument_id)?.clone();
+            let account_currency = self.registry.account_currency(key.account_id)?;
             let mut position = self.positions.remove(&key).unwrap();
             valuation::revalue_position(
                 &mut position,
@@ -548,62 +349,6 @@ impl Engine {
         account.current_drawdown = equity.checked_sub(account.peak_equity)?;
         if account.current_drawdown.amount < account.max_drawdown.amount {
             account.max_drawdown = account.current_drawdown;
-        }
-        Ok(())
-    }
-
-    fn ensure_currency(&self, currency_id: CurrencyId) -> Result<()> {
-        if !self.currencies.contains_key(&currency_id) {
-            return Err(Error::UnknownCurrency(currency_id));
-        }
-        Ok(())
-    }
-
-    fn ensure_account(&self, account_id: AccountId) -> Result<()> {
-        if !self.accounts.contains_key(&account_id) {
-            return Err(Error::UnknownAccount(account_id));
-        }
-        Ok(())
-    }
-
-    fn ensure_book(&self, account_id: AccountId, book_id: BookId) -> Result<()> {
-        if !self.books.contains(&(account_id, book_id)) {
-            return Err(Error::UnknownBook {
-                account_id,
-                book_id,
-            });
-        }
-        Ok(())
-    }
-
-    fn ensure_instrument(&self, instrument_id: InstrumentId) -> Result<&InstrumentMeta> {
-        self.instruments
-            .get(&instrument_id)
-            .ok_or(Error::UnknownInstrument(instrument_id))
-    }
-
-    fn ensure_money(&self, money: Money, currency_id: CurrencyId) -> Result<()> {
-        self.ensure_currency(currency_id)?;
-        if money.currency_id != currency_id || money.scale != self.config.account_money_scale {
-            return Err(Error::InvalidScale);
-        }
-        Ok(())
-    }
-
-    fn ensure_account_currency(
-        &self,
-        account_id: AccountId,
-        currency_id: CurrencyId,
-    ) -> Result<()> {
-        let account = self
-            .accounts
-            .get(&account_id)
-            .ok_or(Error::UnknownAccount(account_id))?;
-        if account.base_currency != currency_id {
-            return Err(Error::CurrencyMismatch {
-                money_currency: currency_id,
-                expected_currency: account.base_currency,
-            });
         }
         Ok(())
     }

@@ -1,8 +1,8 @@
-use crate::engine::{
-    AccountState, FxRate, FxRateUpdate, InstrumentMeta, Mark, MarkPriceUpdate, Position,
-    PositionKey,
-};
 use crate::error::{Error, Result};
+use crate::event::{FxRateUpdate, MarkPriceUpdate};
+use crate::metadata::InstrumentMeta;
+use crate::position::{FxRate, Mark, Position, PositionKey};
+use crate::registry::Registry;
 use crate::types::{
     convert_money_with_rate, money_from_components, value_qty_price_multiplier, CurrencyId, Money,
     Price, RoundingMode,
@@ -218,8 +218,7 @@ pub(crate) fn positions_affected_by_mark(
 
 pub(crate) fn positions_affected_by_fx_rate(
     positions: &BTreeMap<PositionKey, Position>,
-    instruments: &BTreeMap<crate::types::InstrumentId, InstrumentMeta>,
-    accounts: &BTreeMap<crate::types::AccountId, AccountState>,
+    registry: &Registry,
     from_currency_id: CurrencyId,
     to_currency_id: CurrencyId,
 ) -> Vec<PositionKey> {
@@ -227,28 +226,24 @@ pub(crate) fn positions_affected_by_fx_rate(
         .keys()
         .copied()
         .filter(|key| {
-            let Some(instrument) = instruments.get(&key.instrument_id) else {
-                return false;
-            };
-            let Some(account) = accounts.get(&key.account_id) else {
-                return false;
-            };
-            instrument.currency_id == from_currency_id && account.base_currency == to_currency_id
+            registry
+                .instrument(key.instrument_id)
+                .is_ok_and(|instrument| instrument.currency_id == from_currency_id)
+                && registry
+                    .account_currency(key.account_id)
+                    .is_ok_and(|currency| currency == to_currency_id)
         })
         .collect()
 }
 
 pub(crate) fn ensure_direct_rates_for_positions(
     keys: &[PositionKey],
-    accounts: &BTreeMap<crate::types::AccountId, AccountState>,
+    registry: &Registry,
     instrument_currency_id: CurrencyId,
     rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
 ) -> Result<()> {
     for key in keys {
-        let account_currency = accounts
-            .get(&key.account_id)
-            .ok_or(Error::UnknownAccount(key.account_id))?
-            .base_currency;
+        let account_currency = registry.account_currency(key.account_id)?;
         ensure_direct_rate(rates, instrument_currency_id, account_currency)?;
     }
     Ok(())
@@ -271,7 +266,7 @@ fn direct_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{AccountState, InstrumentMeta};
+    use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta};
     use crate::types::{AccountId, BookId, FixedI128, InstrumentId, Qty};
 
     fn usd() -> CurrencyId {
@@ -325,6 +320,44 @@ mod tests {
             opened_at_unix_ns: Some(1),
             updated_at_unix_ns: 1,
         }
+    }
+
+    fn registry() -> Registry {
+        let mut registry = Registry::new();
+        registry
+            .register_currency(
+                CurrencyMeta {
+                    currency_id: usd(),
+                    code: "USD".to_string(),
+                    scale: 2,
+                },
+                2,
+            )
+            .unwrap();
+        registry
+            .register_currency(
+                CurrencyMeta {
+                    currency_id: eur(),
+                    code: "EUR".to_string(),
+                    scale: 2,
+                },
+                2,
+            )
+            .unwrap();
+        registry
+            .register_account(AccountMeta {
+                account_id: AccountId(1),
+                base_currency: usd(),
+            })
+            .unwrap();
+        registry
+            .register_book(BookMeta {
+                account_id: AccountId(1),
+                book_id: BookId(1),
+            })
+            .unwrap();
+        registry.register_instrument(instrument(eur())).unwrap();
+        registry
     }
 
     #[test]
@@ -407,27 +440,9 @@ mod tests {
         };
         let mut positions = BTreeMap::new();
         positions.insert(key, position(money("1000.00", usd())));
-        let mut instruments = BTreeMap::new();
-        instruments.insert(InstrumentId(1), instrument(eur()));
-        let mut accounts = BTreeMap::new();
-        accounts.insert(
-            AccountId(1),
-            AccountState {
-                account_id: AccountId(1),
-                base_currency: usd(),
-                initial_cash: money("0", usd()),
-                cash: money("0", usd()),
-                net_external_cash_flows: money("0", usd()),
-                realized_pnl: money("0", usd()),
-                peak_equity: money("0", usd()),
-                current_drawdown: money("0", usd()),
-                max_drawdown: money("0", usd()),
-                initial_cash_set: false,
-            },
-        );
+        let registry = registry();
 
-        let affected =
-            positions_affected_by_fx_rate(&positions, &instruments, &accounts, eur(), usd());
+        let affected = positions_affected_by_fx_rate(&positions, &registry, eur(), usd());
 
         assert_eq!(affected, vec![key]);
     }

@@ -1,5 +1,7 @@
-use crate::engine::{Fill, InstrumentMeta, Position, PositionKey};
 use crate::error::{Error, Result};
+use crate::event::Fill;
+use crate::metadata::InstrumentMeta;
+use crate::position::{Position, PositionKey};
 use crate::types::{
     div_round, value_qty_price_multiplier, CurrencyId, Money, Price, Qty, RoundingMode,
 };

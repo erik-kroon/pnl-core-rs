@@ -1,6 +1,7 @@
-use crate::engine::{AccountSummary, Engine};
-use crate::error::{Error, Result};
+use crate::engine::Engine;
+use crate::error::Result;
 use crate::snapshot::StateHash;
+use crate::summary::AccountSummary;
 use crate::types::*;
 use crate::valuation;
 
@@ -27,10 +28,8 @@ pub(crate) struct AccountMetrics {
 
 impl AccountMetrics {
     pub(crate) fn compute(engine: &Engine, account_id: AccountId) -> Result<Self> {
-        let account = engine
-            .accounts
-            .get(&account_id)
-            .ok_or(Error::UnknownAccount(account_id))?;
+        engine.registry.ensure_account(account_id)?;
+        let account = engine.accounts.get(&account_id).unwrap();
         let totals = valuation::account_position_totals(
             engine
                 .positions
@@ -109,10 +108,9 @@ impl AccountMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{
-        AccountMeta, BookMeta, EngineConfig, Event, EventKind, Fill, InitialCash, InstrumentMeta,
-        MarkPriceUpdate,
-    };
+    use crate::config::EngineConfig;
+    use crate::event::{Event, EventKind, Fill, InitialCash, MarkPriceUpdate};
+    use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
 
     fn money(value: &str) -> Money {
         Money::parse_decimal(value, CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
@@ -125,7 +123,7 @@ mod tests {
     fn setup() -> Engine {
         let mut engine = Engine::new(EngineConfig::default());
         engine
-            .register_currency(crate::engine::CurrencyMeta {
+            .register_currency(CurrencyMeta {
                 currency_id: CurrencyId::usd(),
                 code: "USD".to_string(),
                 scale: ACCOUNT_MONEY_SCALE,

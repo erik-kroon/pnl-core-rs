@@ -1,5 +1,11 @@
-use crate::engine::*;
+use crate::account::AccountState;
+use crate::config::EngineConfig;
+use crate::engine::Engine;
 use crate::error::{Error, Result};
+use crate::event::Event;
+use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
+use crate::position::{FxRate, Mark, Position};
+use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
@@ -61,17 +67,10 @@ impl CanonicalStateV1 {
     pub(crate) fn from_engine(engine: &Engine) -> Self {
         Self {
             config: engine.config.clone(),
-            currencies: engine.currencies.values().cloned().collect(),
+            currencies: engine.registry.currencies().cloned().collect(),
             accounts: engine.accounts.values().cloned().collect(),
-            books: engine
-                .books
-                .iter()
-                .map(|(account_id, book_id)| BookMeta {
-                    account_id: *account_id,
-                    book_id: *book_id,
-                })
-                .collect(),
-            instruments: engine.instruments.values().cloned().collect(),
+            books: engine.registry.books().collect(),
+            instruments: engine.registry.instruments().cloned().collect(),
             positions: engine.positions.values().cloned().collect(),
             marks: engine.marks.values().cloned().collect(),
             fx_rates: engine.fx_rates.values().cloned().collect(),
@@ -87,27 +86,39 @@ impl CanonicalStateV1 {
     }
 
     fn into_engine(self) -> Engine {
-        Engine {
-            config: self.config,
-            currencies: self
-                .currencies
+        let accounts = self.accounts;
+        let registry = Registry::from_parts(
+            self.currencies
                 .into_iter()
                 .map(|meta| (meta.currency_id, meta))
                 .collect(),
-            accounts: self
-                .accounts
-                .into_iter()
-                .map(|account| (account.account_id, account))
+            accounts
+                .iter()
+                .map(|account| {
+                    (
+                        account.account_id,
+                        AccountMeta {
+                            account_id: account.account_id,
+                            base_currency: account.base_currency,
+                        },
+                    )
+                })
                 .collect(),
-            books: self
-                .books
+            self.books
                 .into_iter()
                 .map(|book| (book.account_id, book.book_id))
                 .collect(),
-            instruments: self
-                .instruments
+            self.instruments
                 .into_iter()
                 .map(|meta| (meta.instrument_id, meta))
+                .collect(),
+        );
+        Engine {
+            config: self.config,
+            registry,
+            accounts: accounts
+                .into_iter()
+                .map(|account| (account.account_id, account))
                 .collect(),
             positions: self.positions.into_iter().map(|p| (p.key, p)).collect(),
             marks: self
@@ -210,11 +221,27 @@ impl Engine {
     }
 
     fn validate_restored_state(&self) -> Result<()> {
-        if !self.currencies.contains_key(&self.config.base_currency) {
+        if self
+            .registry
+            .ensure_currency(self.config.base_currency)
+            .is_err()
+        {
             return Err(Error::SnapshotValidation("missing base currency"));
         }
         for account in self.accounts.values() {
-            if !self.currencies.contains_key(&account.base_currency) {
+            if self.registry.ensure_account(account.account_id).is_err()
+                || self
+                    .registry
+                    .account_currency(account.account_id)
+                    .is_ok_and(|currency| currency != account.base_currency)
+            {
+                return Err(Error::SnapshotValidation("account metadata invalid"));
+            }
+            if self
+                .registry
+                .ensure_currency(account.base_currency)
+                .is_err()
+            {
                 return Err(Error::SnapshotValidation("account currency missing"));
             }
             if account.cash.currency_id != account.base_currency
@@ -223,22 +250,31 @@ impl Engine {
                 return Err(Error::SnapshotValidation("invalid account cash"));
             }
         }
-        for (account_id, book_id) in &self.books {
-            if !self.accounts.contains_key(account_id) {
+        for book in self.registry.books() {
+            let account_id = book.account_id;
+            let book_id = book.book_id;
+            if !self.accounts.contains_key(&account_id) {
                 return Err(Error::SnapshotValidation("book references missing account"));
             }
             if book_id.0 == 0 {
                 return Err(Error::SnapshotValidation("invalid book id"));
             }
         }
-        for instrument in self.instruments.values() {
-            if !self.currencies.contains_key(&instrument.currency_id) {
+        for instrument in self.registry.instruments() {
+            if self
+                .registry
+                .ensure_currency(instrument.currency_id)
+                .is_err()
+            {
                 return Err(Error::SnapshotValidation("instrument currency missing"));
             }
         }
         for rate in self.fx_rates.values() {
-            if !self.currencies.contains_key(&rate.from_currency_id)
-                || !self.currencies.contains_key(&rate.to_currency_id)
+            if self
+                .registry
+                .ensure_currency(rate.from_currency_id)
+                .is_err()
+                || self.registry.ensure_currency(rate.to_currency_id).is_err()
                 || rate.rate.value <= 0
             {
                 return Err(Error::SnapshotValidation("invalid fx rate"));
@@ -246,10 +282,14 @@ impl Engine {
         }
         for position in self.positions.values() {
             if !self.accounts.contains_key(&position.key.account_id)
-                || !self
-                    .books
-                    .contains(&(position.key.account_id, position.key.book_id))
-                || !self.instruments.contains_key(&position.key.instrument_id)
+                || self
+                    .registry
+                    .ensure_book(position.key.account_id, position.key.book_id)
+                    .is_err()
+                || self
+                    .registry
+                    .instrument(position.key.instrument_id)
+                    .is_err()
             {
                 return Err(Error::SnapshotValidation("position reference invalid"));
             }
