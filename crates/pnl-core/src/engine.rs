@@ -1,4 +1,7 @@
-use crate::accounting::{apply_average_cost_fill, AverageCostFill};
+use crate::accounting::{
+    apply_average_cost_fill, fill_position_key, revalue_position, AverageCostConfig,
+    AverageCostFillInput, PositionRevaluation,
+};
 use crate::error::{Error, Result};
 use crate::replay_journal::{JournalAction, ReplayJournal};
 use crate::snapshot::{CanonicalStateV1, StateHash};
@@ -520,53 +523,24 @@ impl Engine {
         let instrument = self.ensure_instrument(fill.instrument_id)?.clone();
         let account_currency = self.accounts.get(&fill.account_id).unwrap().base_currency;
         self.ensure_money(fill.fee, fill.fee.currency_id)?;
-        let fee = self.convert_money(fill.fee, account_currency)?;
-        let qty = fill.qty.to_scale_exact(instrument.qty_scale)?;
-        if qty.value <= 0 {
-            return Err(Error::InvalidQuantity);
-        }
-        let price = fill
-            .price
-            .to_scale(instrument.price_scale, self.config.rounding_mode)?;
-
-        let signed_delta = qty
-            .value
-            .checked_mul(fill.side.sign())
-            .ok_or(Error::ArithmeticOverflow)?;
-        let key = PositionKey {
-            account_id: fill.account_id,
-            book_id: fill.book_id,
-            instrument_id: fill.instrument_id,
-        };
+        let key = fill_position_key(fill);
 
         let position = self.positions.remove(&key);
         let mut outcome = apply_average_cost_fill(
-            position,
-            AverageCostFill {
-                key,
-                qty,
-                signed_delta,
-                price,
-                fee,
-                account_money_scale: self.config.account_money_scale,
-                price_scale: instrument.price_scale,
-                rounding: self.config.rounding_mode,
-                allow_short: self.config.allow_short,
-                allow_position_flip: self.config.allow_position_flip,
+            AverageCostFillInput {
+                position,
+                fill,
+                instrument: &instrument,
+                account_currency,
+                config: AverageCostConfig {
+                    account_money_scale: self.config.account_money_scale,
+                    rounding: self.config.rounding_mode,
+                    allow_short: self.config.allow_short,
+                    allow_position_flip: self.config.allow_position_flip,
+                },
                 ts_unix_ns,
             },
-            |signed_qty| {
-                let trade_value = value_qty_price_multiplier(
-                    signed_qty,
-                    qty.scale,
-                    price,
-                    instrument.multiplier,
-                    instrument.currency_id,
-                    self.config.account_money_scale,
-                    self.config.rounding_mode,
-                )?;
-                self.convert_money(trade_value, account_currency)
-            },
+            |money, to_currency_id| self.convert_money(money, to_currency_id),
         )?;
         let cash_delta = outcome.cash_delta;
         let realized_delta = outcome.realized_delta;
@@ -577,7 +551,7 @@ impl Engine {
         account.realized_pnl = account.realized_pnl.checked_add(realized_delta)?;
 
         self.positions.insert(key, outcome.position);
-        Ok((key, cash_delta, realized_delta))
+        Ok((outcome.key, cash_delta, realized_delta))
     }
 
     fn apply_mark(
@@ -675,31 +649,19 @@ impl Engine {
             .get(&position.key.account_id)
             .ok_or(Error::UnknownAccount(position.key.account_id))?
             .base_currency;
-        let zero = Money::zero(account_currency, self.config.account_money_scale);
-        if position.signed_qty.value == 0 {
-            position.unrealized_pnl = zero;
-            position.gross_exposure = zero;
-            position.net_exposure = zero;
-            return Ok(());
-        }
         let valuation_price = self.marks.get(&position.key.instrument_id).map(|m| m.price);
-        position.net_exposure = if let Some(valuation_price) = valuation_price {
-            let exposure = value_qty_price_multiplier(
-                position.signed_qty.value,
-                position.signed_qty.scale,
+        revalue_position(
+            position,
+            PositionRevaluation {
+                account_currency,
+                account_money_scale: self.config.account_money_scale,
                 valuation_price,
-                instrument.multiplier,
-                instrument.currency_id,
-                self.config.account_money_scale,
-                self.config.rounding_mode,
-            )?;
-            self.convert_money(exposure, account_currency)?
-        } else {
-            position.cost_basis
-        };
-        position.gross_exposure = position.net_exposure.abs();
-        position.unrealized_pnl = position.net_exposure.checked_sub(position.cost_basis)?;
-        Ok(())
+                instrument_currency: instrument.currency_id,
+                multiplier: instrument.multiplier,
+                rounding: self.config.rounding_mode,
+            },
+            |money, to_currency_id| self.convert_money(money, to_currency_id),
+        )
     }
 
     pub(super) fn update_drawdown(&mut self, account_id: AccountId) -> Result<()> {
