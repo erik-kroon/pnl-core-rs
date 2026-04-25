@@ -5,4 +5,4 @@
 - Initial Rust workspace for `pnl-core-rs`.
 - Added deterministic fixed-point v1 accounting engine.
 - Added strict replay, snapshots, state hashes, CLI demo, tests, and benchmarks.
-
+- Added direct FX-rate events for multi-currency instruments, fees, account summaries, and revaluation.

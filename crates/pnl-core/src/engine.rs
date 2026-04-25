@@ -89,6 +89,14 @@ pub struct Mark {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FxRate {
+    pub from_currency_id: CurrencyId,
+    pub to_currency_id: CurrencyId,
+    pub rate: Price,
+    pub ts_unix_ns: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountState {
     pub account_id: AccountId,
     pub base_currency: CurrencyId,
@@ -116,6 +124,7 @@ pub enum EventKind {
     CashAdjustment(CashAdjustment),
     Fill(Fill),
     Mark(MarkPriceUpdate),
+    FxRate(FxRateUpdate),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +157,13 @@ pub struct Fill {
 pub struct MarkPriceUpdate {
     pub instrument_id: InstrumentId,
     pub price: Price,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FxRateUpdate {
+    pub from_currency_id: CurrencyId,
+    pub to_currency_id: CurrencyId,
+    pub rate: Price,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +203,7 @@ pub struct Engine {
     pub(crate) instruments: BTreeMap<InstrumentId, InstrumentMeta>,
     pub(crate) positions: BTreeMap<PositionKey, Position>,
     pub(crate) marks: BTreeMap<InstrumentId, Mark>,
+    pub(crate) fx_rates: BTreeMap<(CurrencyId, CurrencyId), FxRate>,
     pub(crate) seen_events: BTreeSet<EventId>,
     pub(crate) last_seq: u64,
 }
@@ -201,6 +218,7 @@ impl Engine {
             instruments: BTreeMap::new(),
             positions: BTreeMap::new(),
             marks: BTreeMap::new(),
+            fx_rates: BTreeMap::new(),
             seen_events: BTreeSet::new(),
             last_seq: 0,
         }
@@ -215,12 +233,6 @@ impl Engine {
     }
 
     pub fn register_currency(&mut self, meta: CurrencyMeta) -> Result<()> {
-        if meta.currency_id != self.config.base_currency {
-            return Err(Error::MultiCurrencyUnsupported {
-                instrument_currency: meta.currency_id,
-                account_currency: self.config.base_currency,
-            });
-        }
         if meta.scale != self.config.account_money_scale {
             return Err(Error::InvalidScale);
         }
@@ -230,12 +242,6 @@ impl Engine {
 
     pub fn register_account(&mut self, meta: AccountMeta) -> Result<()> {
         self.ensure_currency(meta.base_currency)?;
-        if meta.base_currency != self.config.base_currency {
-            return Err(Error::MultiCurrencyUnsupported {
-                instrument_currency: meta.base_currency,
-                account_currency: self.config.base_currency,
-            });
-        }
         let zero = Money::zero(meta.base_currency, self.config.account_money_scale);
         self.accounts.insert(
             meta.account_id,
@@ -263,12 +269,6 @@ impl Engine {
 
     pub fn register_instrument(&mut self, meta: InstrumentMeta) -> Result<()> {
         self.ensure_currency(meta.currency_id)?;
-        if meta.currency_id != self.config.base_currency {
-            return Err(Error::MultiCurrencyUnsupported {
-                instrument_currency: meta.currency_id,
-                account_currency: self.config.base_currency,
-            });
-        }
         if meta.multiplier.value <= 0 {
             return Err(Error::InvalidScale);
         }
@@ -299,6 +299,7 @@ impl Engine {
             EventKind::InitialCash(initial) => {
                 self.ensure_account(initial.account_id)?;
                 self.ensure_money(initial.amount, initial.currency_id)?;
+                self.ensure_account_currency(initial.account_id, initial.currency_id)?;
                 let account = self.accounts.get_mut(&initial.account_id).unwrap();
                 let delta = initial.amount.checked_sub(account.cash)?;
                 account.initial_cash = initial.amount;
@@ -310,6 +311,7 @@ impl Engine {
             EventKind::CashAdjustment(adj) => {
                 self.ensure_account(adj.account_id)?;
                 self.ensure_money(adj.amount, adj.currency_id)?;
+                self.ensure_account_currency(adj.account_id, adj.currency_id)?;
                 let account = self.accounts.get_mut(&adj.account_id).unwrap();
                 account.cash = account.cash.checked_add(adj.amount)?;
                 account.net_external_cash_flows =
@@ -327,6 +329,14 @@ impl Engine {
             EventKind::Mark(mark) => {
                 self.apply_mark(
                     mark,
+                    event.ts_unix_ns,
+                    &mut changed_positions,
+                    &mut drawdown_accounts,
+                )?;
+            }
+            EventKind::FxRate(fx) => {
+                self.apply_fx_rate(
+                    fx,
                     event.ts_unix_ns,
                     &mut changed_positions,
                     &mut drawdown_accounts,
@@ -403,13 +413,8 @@ impl Engine {
         self.ensure_book(fill.account_id, fill.book_id)?;
         let instrument = self.ensure_instrument(fill.instrument_id)?.clone();
         let account_currency = self.accounts.get(&fill.account_id).unwrap().base_currency;
-        if instrument.currency_id != account_currency {
-            return Err(Error::MultiCurrencyUnsupported {
-                instrument_currency: instrument.currency_id,
-                account_currency,
-            });
-        }
-        self.ensure_money(fill.fee, account_currency)?;
+        self.ensure_money(fill.fee, fill.fee.currency_id)?;
+        let fee = self.convert_money(fill.fee, account_currency)?;
         let qty = fill.qty.to_scale_exact(instrument.qty_scale)?;
         if qty.value <= 0 {
             return Err(Error::InvalidQuantity);
@@ -437,8 +442,9 @@ impl Engine {
             self.config.account_money_scale,
             self.config.rounding_mode,
         )?;
+        let signed_trade_value = self.convert_money(signed_trade_value, account_currency)?;
         let signed_cash_trade = signed_trade_value.checked_neg()?;
-        let cash_delta = signed_cash_trade.checked_sub(fill.fee)?;
+        let cash_delta = signed_cash_trade.checked_sub(fee)?;
 
         let zero = Money::zero(account_currency, self.config.account_money_scale);
         let mut position = self.positions.remove(&key).unwrap_or_else(|| Position {
@@ -469,7 +475,7 @@ impl Engine {
             return Err(Error::PositionFlipNotAllowed);
         }
 
-        let mut realized_delta = fill.fee.checked_neg()?;
+        let mut realized_delta = fee.checked_neg()?;
         if old_qty == 0 || old_qty.signum() == signed_delta.signum() {
             position.avg_price = Some(if old_qty == 0 {
                 price
@@ -515,6 +521,7 @@ impl Engine {
                 self.config.account_money_scale,
                 self.config.rounding_mode,
             )?;
+            let closing_trade_value = self.convert_money(closing_trade_value, account_currency)?;
             let closing_cash_trade = closing_trade_value.checked_neg()?;
             let realized = closing_cash_trade.checked_sub(closed_basis)?;
             realized_delta = realized_delta.checked_add(realized)?;
@@ -524,7 +531,7 @@ impl Engine {
                 position.opened_at_unix_ns = None;
             } else if old_qty.signum() != new_qty.signum() {
                 position.avg_price = Some(price);
-                position.cost_basis = value_qty_price_multiplier(
+                let new_cost_basis = value_qty_price_multiplier(
                     new_qty,
                     qty.scale,
                     price,
@@ -533,6 +540,7 @@ impl Engine {
                     self.config.account_money_scale,
                     self.config.rounding_mode,
                 )?;
+                position.cost_basis = self.convert_money(new_cost_basis, account_currency)?;
                 position.opened_at_unix_ns = Some(ts_unix_ns);
             } else {
                 position.cost_basis = old_cost_basis.checked_sub(closed_basis)?;
@@ -563,6 +571,17 @@ impl Engine {
         let price = mark
             .price
             .to_scale(instrument.price_scale, self.config.rounding_mode)?;
+        let keys: Vec<_> = self
+            .positions
+            .keys()
+            .copied()
+            .filter(|key| key.instrument_id == mark.instrument_id)
+            .collect();
+        for key in &keys {
+            let account_currency = self.accounts.get(&key.account_id).unwrap().base_currency;
+            self.ensure_conversion_rate(instrument.currency_id, account_currency)?;
+        }
+
         self.marks.insert(
             mark.instrument_id,
             Mark {
@@ -571,13 +590,6 @@ impl Engine {
                 ts_unix_ns,
             },
         );
-
-        let keys: Vec<_> = self
-            .positions
-            .keys()
-            .copied()
-            .filter(|key| key.instrument_id == mark.instrument_id)
-            .collect();
         for key in keys {
             let mut position = self.positions.remove(&key).unwrap();
             self.revalue_position(&mut position, &instrument)?;
@@ -588,8 +600,62 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_fx_rate(
+        &mut self,
+        fx: &FxRateUpdate,
+        ts_unix_ns: i64,
+        changed_positions: &mut Vec<PositionKey>,
+        drawdown_accounts: &mut BTreeSet<AccountId>,
+    ) -> Result<()> {
+        self.ensure_currency(fx.from_currency_id)?;
+        self.ensure_currency(fx.to_currency_id)?;
+        if fx.rate.value <= 0 {
+            return Err(Error::InvalidPrice);
+        }
+        let rate = fx.rate.to_scale(fx.rate.scale, self.config.rounding_mode)?;
+        self.fx_rates.insert(
+            (fx.from_currency_id, fx.to_currency_id),
+            FxRate {
+                from_currency_id: fx.from_currency_id,
+                to_currency_id: fx.to_currency_id,
+                rate,
+                ts_unix_ns,
+            },
+        );
+
+        let keys: Vec<_> = self
+            .positions
+            .keys()
+            .copied()
+            .filter(|key| {
+                let Some(instrument) = self.instruments.get(&key.instrument_id) else {
+                    return false;
+                };
+                let Some(account) = self.accounts.get(&key.account_id) else {
+                    return false;
+                };
+                instrument.currency_id == fx.from_currency_id
+                    && account.base_currency == fx.to_currency_id
+            })
+            .collect();
+        for key in keys {
+            let instrument = self.instruments.get(&key.instrument_id).unwrap().clone();
+            let mut position = self.positions.remove(&key).unwrap();
+            self.revalue_position(&mut position, &instrument)?;
+            drawdown_accounts.insert(key.account_id);
+            changed_positions.push(key);
+            self.positions.insert(key, position);
+        }
+        Ok(())
+    }
+
     fn revalue_position(&self, position: &mut Position, instrument: &InstrumentMeta) -> Result<()> {
-        let zero = Money::zero(instrument.currency_id, self.config.account_money_scale);
+        let account_currency = self
+            .accounts
+            .get(&position.key.account_id)
+            .ok_or(Error::UnknownAccount(position.key.account_id))?
+            .base_currency;
+        let zero = Money::zero(account_currency, self.config.account_money_scale);
         if position.signed_qty.value == 0 {
             position.unrealized_pnl = zero;
             position.gross_exposure = zero;
@@ -598,7 +664,7 @@ impl Engine {
         }
         let valuation_price = self.marks.get(&position.key.instrument_id).map(|m| m.price);
         position.net_exposure = if let Some(valuation_price) = valuation_price {
-            value_qty_price_multiplier(
+            let exposure = value_qty_price_multiplier(
                 position.signed_qty.value,
                 position.signed_qty.scale,
                 valuation_price,
@@ -606,7 +672,8 @@ impl Engine {
                 instrument.currency_id,
                 self.config.account_money_scale,
                 self.config.rounding_mode,
-            )?
+            )?;
+            self.convert_money(exposure, account_currency)?
         } else {
             position.cost_basis
         };
@@ -722,6 +789,69 @@ impl Engine {
             return Err(Error::InvalidScale);
         }
         Ok(())
+    }
+
+    fn ensure_account_currency(
+        &self,
+        account_id: AccountId,
+        currency_id: CurrencyId,
+    ) -> Result<()> {
+        let account = self
+            .accounts
+            .get(&account_id)
+            .ok_or(Error::UnknownAccount(account_id))?;
+        if account.base_currency != currency_id {
+            return Err(Error::CurrencyMismatch {
+                money_currency: currency_id,
+                expected_currency: account.base_currency,
+            });
+        }
+        Ok(())
+    }
+
+    fn convert_money(&self, money: Money, to_currency_id: CurrencyId) -> Result<Money> {
+        if money.currency_id == to_currency_id {
+            return money_from_components(
+                money.amount,
+                money.scale,
+                to_currency_id,
+                self.config.account_money_scale,
+                self.config.rounding_mode,
+            );
+        }
+        let rate = self
+            .fx_rates
+            .get(&(money.currency_id, to_currency_id))
+            .ok_or(Error::MissingFxRate {
+                from_currency: money.currency_id,
+                to_currency: to_currency_id,
+            })?
+            .rate;
+        convert_money_with_rate(
+            money,
+            to_currency_id,
+            rate,
+            self.config.account_money_scale,
+            self.config.rounding_mode,
+        )
+    }
+
+    fn ensure_conversion_rate(
+        &self,
+        from_currency_id: CurrencyId,
+        to_currency_id: CurrencyId,
+    ) -> Result<()> {
+        if from_currency_id == to_currency_id
+            || self
+                .fx_rates
+                .contains_key(&(from_currency_id, to_currency_id))
+        {
+            return Ok(());
+        }
+        Err(Error::MissingFxRate {
+            from_currency: from_currency_id,
+            to_currency: to_currency_id,
+        })
     }
 }
 

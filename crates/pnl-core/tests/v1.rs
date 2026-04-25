@@ -5,6 +5,14 @@ fn money(value: &str) -> Money {
     Money::parse_decimal(value, CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
 }
 
+fn eur() -> CurrencyId {
+    CurrencyId::from_code("EUR").unwrap()
+}
+
+fn money_in(value: &str, currency_id: CurrencyId) -> Money {
+    Money::parse_decimal(value, currency_id, ACCOUNT_MONEY_SCALE).unwrap()
+}
+
 fn price(value: &str) -> Price {
     Price::parse_decimal(value).unwrap()
 }
@@ -43,6 +51,42 @@ fn setup() -> Engine {
     engine
 }
 
+fn setup_eur_instrument_usd_account() -> Engine {
+    let mut engine = Engine::new(EngineConfig::default());
+    for (currency_id, code) in [(CurrencyId::usd(), "USD"), (eur(), "EUR")] {
+        engine
+            .register_currency(CurrencyMeta {
+                currency_id,
+                code: code.to_string(),
+                scale: ACCOUNT_MONEY_SCALE,
+            })
+            .unwrap();
+    }
+    engine
+        .register_account(AccountMeta {
+            account_id: AccountId(1),
+            base_currency: CurrencyId::usd(),
+        })
+        .unwrap();
+    engine
+        .register_book(BookMeta {
+            account_id: AccountId(1),
+            book_id: BookId(1),
+        })
+        .unwrap();
+    engine
+        .register_instrument(InstrumentMeta {
+            instrument_id: InstrumentId(1),
+            symbol: "SAP".to_string(),
+            currency_id: eur(),
+            price_scale: 4,
+            qty_scale: 0,
+            multiplier: FixedI128::one(),
+        })
+        .unwrap();
+    engine
+}
+
 fn initial(seq: u64, amount: &str) -> Event {
     Event {
         seq,
@@ -52,6 +96,19 @@ fn initial(seq: u64, amount: &str) -> Event {
             account_id: AccountId(1),
             currency_id: CurrencyId::usd(),
             amount: money(amount),
+        }),
+    }
+}
+
+fn fx(seq: u64, from_currency_id: CurrencyId, to_currency_id: CurrencyId, rate: &str) -> Event {
+    Event {
+        seq,
+        event_id: EventId(seq),
+        ts_unix_ns: seq as i64,
+        kind: EventKind::FxRate(FxRateUpdate {
+            from_currency_id,
+            to_currency_id,
+            rate: price(rate),
         }),
     }
 }
@@ -87,6 +144,30 @@ fn fill(seq: u64, side: Side, qty: i128, px: &str, fee: &str) -> Event {
     }
 }
 
+fn fill_fee_currency(
+    seq: u64,
+    side: Side,
+    qty: i128,
+    px: &str,
+    fee: &str,
+    fee_currency_id: CurrencyId,
+) -> Event {
+    Event {
+        seq,
+        event_id: EventId(seq),
+        ts_unix_ns: seq as i64,
+        kind: EventKind::Fill(Fill {
+            account_id: AccountId(1),
+            book_id: BookId(1),
+            instrument_id: InstrumentId(1),
+            side,
+            qty: Qty::from_units(qty),
+            price: price(px),
+            fee: money_in(fee, fee_currency_id),
+        }),
+    }
+}
+
 fn mark(seq: u64, px: &str) -> Event {
     Event {
         seq,
@@ -115,6 +196,83 @@ fn open_long_and_mark_reconciles_cash_equity_and_pnl() {
     assert_eq!(summary.realized_pnl, money("-1.00"));
     assert_eq!(summary.unrealized_pnl, money("200.00"));
     assert_eq!(summary.total_pnl, money("199.00"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn cross_currency_fill_mark_and_fx_revalue_in_account_currency() {
+    let mut engine = setup_eur_instrument_usd_account();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine
+        .apply(fx(2, eur(), CurrencyId::usd(), "1.10"))
+        .unwrap();
+    engine
+        .apply(fill_fee_currency(3, Side::Buy, 10, "100.00", "2.00", eur()))
+        .unwrap();
+    engine.apply(mark(4, "110.00")).unwrap();
+
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    assert_eq!(summary.cash, money("8897.80"));
+    assert_eq!(summary.position_market_value, money("1210.00"));
+    assert_eq!(summary.equity, money("10107.80"));
+    assert_eq!(summary.realized_pnl, money("-2.20"));
+    assert_eq!(summary.unrealized_pnl, money("110.00"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+
+    engine
+        .apply(fx(5, eur(), CurrencyId::usd(), "1.20"))
+        .unwrap();
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    assert_eq!(summary.position_market_value, money("1320.00"));
+    assert_eq!(summary.equity, money("10217.80"));
+    assert_eq!(summary.realized_pnl, money("-2.20"));
+    assert_eq!(summary.unrealized_pnl, money("220.00"));
+    assert_eq!(summary.total_pnl, money("217.80"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn cross_currency_fill_requires_direct_fx_rate() {
+    let mut engine = setup_eur_instrument_usd_account();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    let err = engine
+        .apply(fill(2, Side::Buy, 10, "100.00", "0"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        Error::MissingFxRate {
+            from_currency: eur(),
+            to_currency: CurrencyId::usd(),
+        }
+    );
+}
+
+#[test]
+fn cross_currency_close_realizes_pnl_at_current_fx_rate() {
+    let mut engine = setup_eur_instrument_usd_account();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine
+        .apply(fx(2, eur(), CurrencyId::usd(), "1.10"))
+        .unwrap();
+    engine.apply(fill(3, Side::Buy, 10, "100.00", "0")).unwrap();
+    engine
+        .apply(fx(4, eur(), CurrencyId::usd(), "1.20"))
+        .unwrap();
+    engine.apply(fill(5, Side::Sell, 4, "110.00", "0")).unwrap();
+
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let pos = engine
+        .position(PositionKey {
+            account_id: AccountId(1),
+            book_id: BookId(1),
+            instrument_id: InstrumentId(1),
+        })
+        .unwrap();
+    assert_eq!(pos.signed_qty, Qty::from_units(6));
+    assert_eq!(pos.cost_basis, money("660.00"));
+    assert_eq!(summary.cash, money("9428.00"));
+    assert_eq!(summary.realized_pnl, money("88.00"));
+    assert_eq!(summary.equity, money("10088.00"));
     assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
 }
 

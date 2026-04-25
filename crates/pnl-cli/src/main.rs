@@ -54,13 +54,21 @@ struct CliConfig {
     allow_short: Option<bool>,
     allow_position_flip: Option<bool>,
     expected_start_seq: Option<u64>,
+    currencies: Option<Vec<CliCurrency>>,
     accounts: Option<Vec<CliAccount>>,
     books: Option<Vec<CliBook>>,
 }
 
 #[derive(Debug, Deserialize)]
+struct CliCurrency {
+    code: String,
+    scale: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CliAccount {
     account_id: u64,
+    base_currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,9 +99,13 @@ struct RawEvent {
     book_id: Option<u64>,
     instrument_id: Option<u64>,
     currency: Option<String>,
+    fee_currency: Option<String>,
+    from_currency: Option<String>,
+    to_currency: Option<String>,
     side: Option<String>,
     qty: Option<String>,
     price: Option<String>,
+    rate: Option<String>,
     fee: Option<String>,
     amount: Option<String>,
     reason: Option<String>,
@@ -148,14 +160,38 @@ fn replay(args: ReplayArgs) -> Result<()> {
         code: cli_config.base_currency.clone(),
         scale: engine.config().account_money_scale,
     })?;
+    for currency in cli_config.currencies.unwrap_or_default() {
+        engine.register_currency(CurrencyMeta {
+            currency_id: CurrencyId::from_code(&currency.code)?,
+            code: currency.code,
+            scale: currency
+                .scale
+                .unwrap_or(engine.config().account_money_scale),
+        })?;
+    }
 
-    let accounts = cli_config
-        .accounts
-        .unwrap_or_else(|| vec![CliAccount { account_id: 1 }]);
+    let accounts = cli_config.accounts.unwrap_or_else(|| {
+        vec![CliAccount {
+            account_id: 1,
+            base_currency: None,
+        }]
+    });
     for account in accounts {
+        let account_currency = match account.base_currency {
+            Some(code) => {
+                let currency_id = CurrencyId::from_code(&code)?;
+                engine.register_currency(CurrencyMeta {
+                    currency_id,
+                    code,
+                    scale: engine.config().account_money_scale,
+                })?;
+                currency_id
+            }
+            None => base_currency,
+        };
         engine.register_account(AccountMeta {
             account_id: AccountId(account.account_id),
-            base_currency,
+            base_currency: account_currency,
         })?;
     }
     let books = cli_config.books.unwrap_or_else(|| {
@@ -175,10 +211,16 @@ fn replay(args: ReplayArgs) -> Result<()> {
         .with_context(|| format!("reading {}", instruments_path.display()))?;
     for row in rdr.deserialize::<InstrumentRow>() {
         let row = row?;
+        let currency_id = CurrencyId::from_code(&row.currency)?;
+        engine.register_currency(CurrencyMeta {
+            currency_id,
+            code: row.currency,
+            scale: engine.config().account_money_scale,
+        })?;
         engine.register_instrument(InstrumentMeta {
             instrument_id: InstrumentId(row.instrument_id),
             symbol: row.symbol,
-            currency_id: CurrencyId::from_code(&row.currency)?,
+            currency_id,
             price_scale: row.price_scale,
             qty_scale: row.qty_scale,
             multiplier: FixedI128::parse_decimal(&row.multiplier)?,
@@ -302,7 +344,7 @@ fn raw_event_to_core(raw: RawEvent, base_currency: CurrencyId, money_scale: u8) 
                 price: Price::parse_decimal(required(raw.price.as_deref(), "price")?)?,
                 fee: Money::parse_decimal(
                     raw.fee.as_deref().unwrap_or("0"),
-                    base_currency,
+                    currency(raw.fee_currency.as_deref(), base_currency)?,
                     money_scale,
                 )?,
             })
@@ -310,6 +352,17 @@ fn raw_event_to_core(raw: RawEvent, base_currency: CurrencyId, money_scale: u8) 
         "mark" => EventKind::Mark(MarkPriceUpdate {
             instrument_id: InstrumentId(required(raw.instrument_id, "instrument_id")?),
             price: Price::parse_decimal(required(raw.price.as_deref(), "price")?)?,
+        }),
+        "fx_rate" => EventKind::FxRate(FxRateUpdate {
+            from_currency_id: CurrencyId::from_code(required(
+                raw.from_currency.as_deref(),
+                "from_currency",
+            )?)?,
+            to_currency_id: CurrencyId::from_code(required(
+                raw.to_currency.as_deref(),
+                "to_currency",
+            )?)?,
+            rate: Price::parse_decimal(required(raw.rate.as_deref(), "rate")?)?,
         }),
         other => anyhow::bail!("unsupported event type {other}"),
     };

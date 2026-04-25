@@ -357,6 +357,33 @@ pub fn money_from_components(
     ))
 }
 
+pub fn convert_money_with_rate(
+    money: Money,
+    to_currency_id: CurrencyId,
+    rate: Price,
+    target_scale: u8,
+    rounding: RoundingMode,
+) -> Result<Money> {
+    if money.currency_id == to_currency_id {
+        return money_from_components(
+            money.amount,
+            money.scale,
+            to_currency_id,
+            target_scale,
+            rounding,
+        );
+    }
+    let converted = money
+        .amount
+        .checked_mul(rate.value)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let scale = money
+        .scale
+        .checked_add(rate.scale)
+        .ok_or(Error::ArithmeticOverflow)?;
+    money_from_components(converted, scale, to_currency_id, target_scale, rounding)
+}
+
 pub fn value_qty_price_multiplier(
     qty_value: i128,
     qty_scale: u8,
