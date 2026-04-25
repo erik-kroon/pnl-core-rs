@@ -1,0 +1,6 @@
+{"seq":1,"type":"initial_cash","account_id":1,"currency":"USD","amount":"100000.00","ts_unix_ns":1}
+{"seq":2,"type":"fill","account_id":1,"book_id":1,"instrument_id":1,"side":"buy","qty":"100","price":"185.00","fee":"1.00","ts_unix_ns":2}
+{"seq":3,"type":"mark","instrument_id":1,"price":"187.50","ts_unix_ns":3}
+{"seq":4,"type":"fill","account_id":1,"book_id":1,"instrument_id":1,"side":"sell","qty":"40","price":"188.00","fee":"1.00","ts_unix_ns":4}
+{"seq":5,"type":"cash_adjustment","account_id":1,"currency":"USD","amount":"5000.00","reason":"deposit","ts_unix_ns":5}
+

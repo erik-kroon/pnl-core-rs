@@ -1,0 +1,13 @@
+base_currency = "USD"
+account_money_scale = 4
+allow_short = true
+allow_position_flip = true
+expected_start_seq = 1
+
+[[accounts]]
+account_id = 1
+
+[[books]]
+account_id = 1
+book_id = 1
+
