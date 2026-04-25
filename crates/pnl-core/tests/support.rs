@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use pnl_core::*;
 
 pub const ACCOUNT: AccountId = AccountId(1);
