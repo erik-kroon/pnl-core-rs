@@ -1,4 +1,10 @@
-use crate::engine::{Engine, Event, EventKind, Fill, PositionKey};
+//! Replay ownership for accepted events.
+//!
+//! The journal validates event order and duplicate IDs, retains the canonical
+//! event log, applies correction/bust override rules, and coordinates
+//! deterministic accounting rebuilds after a history rewrite.
+
+use crate::engine::{ApplyResult, Engine, Event, EventKind, Fill, PositionKey};
 use crate::error::{Error, Result};
 use crate::types::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,15 +17,25 @@ pub(crate) struct ReplayJournal {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JournalAction {
+enum JournalAction {
     ApplyAccounting,
     RewriteHistory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RewriteTarget {
-    pub account_id: AccountId,
-    pub position_key: PositionKey,
+struct RewriteTarget {
+    account_id: AccountId,
+    position_key: PositionKey,
+}
+
+pub(crate) fn apply_event(engine: &mut Engine, event: Event) -> Result<ApplyResult> {
+    let action = engine
+        .replay_journal
+        .prepare(engine.config.expected_start_seq, &event)?;
+    match action {
+        JournalAction::ApplyAccounting => apply_accounting_event(engine, event),
+        JournalAction::RewriteHistory => apply_history_rewrite(engine, event),
+    }
 }
 
 impl ReplayJournal {
@@ -59,7 +75,7 @@ impl ReplayJournal {
         Ok(())
     }
 
-    pub fn prepare(&self, expected_start_seq: u64, event: &Event) -> Result<JournalAction> {
+    fn prepare(&self, expected_start_seq: u64, event: &Event) -> Result<JournalAction> {
         self.validate_next_event(expected_start_seq, event)?;
         if matches!(
             event.kind,
@@ -71,13 +87,13 @@ impl ReplayJournal {
         }
     }
 
-    pub fn record_accepted(&mut self, event: Event) {
+    fn record_accepted(&mut self, event: Event) {
         self.last_seq = event.seq;
         self.seen_events.insert(event.event_id);
         self.events.push(event);
     }
 
-    pub fn validate_rewrite_target(&self, event: &Event) -> Result<RewriteTarget> {
+    fn validate_rewrite_target(&self, event: &Event) -> Result<RewriteTarget> {
         let (original_event_id, replacement) = match &event.kind {
             EventKind::TradeCorrection(correction) => {
                 (correction.original_event_id, Some(&correction.replacement))
@@ -95,7 +111,7 @@ impl ReplayJournal {
         })
     }
 
-    pub fn rebuild_engine(&mut self, engine: &mut Engine) -> Result<()> {
+    fn rebuild_accounting_state(&mut self, engine: &mut Engine) -> Result<()> {
         let events = self.events.clone();
         let overrides = correction_overrides(&events)?;
 
@@ -175,6 +191,58 @@ impl ReplayJournal {
             _ => Err(Error::CorrectionTargetNotFill(event_id)),
         }
     }
+}
+
+fn apply_accounting_event(engine: &mut Engine, event: Event) -> Result<ApplyResult> {
+    let (changed_positions, cash_delta, realized_delta, drawdown_accounts) =
+        engine.apply_accounting_effect(&event, &event.kind)?;
+    for account_id in drawdown_accounts {
+        engine.update_drawdown(account_id)?;
+    }
+
+    engine.replay_journal.record_accepted(event);
+    Ok(ApplyResult {
+        sequence: engine.replay_journal.last_seq(),
+        changed_positions,
+        realized_pnl_delta: realized_delta,
+        cash_delta,
+        state_hash: engine.state_hash(),
+    })
+}
+
+fn apply_history_rewrite(engine: &mut Engine, event: Event) -> Result<ApplyResult> {
+    let target = engine.replay_journal.validate_rewrite_target(&event)?;
+    let before_account = engine
+        .accounts
+        .get(&target.account_id)
+        .ok_or(Error::UnknownAccount(target.account_id))?
+        .clone();
+
+    let mut next = engine.clone();
+    next.replay_journal.record_accepted(event);
+    let mut journal = std::mem::take(&mut next.replay_journal);
+    journal.rebuild_accounting_state(&mut next)?;
+    next.replay_journal = journal;
+
+    let after_account = next
+        .accounts
+        .get(&target.account_id)
+        .ok_or(Error::UnknownAccount(target.account_id))?;
+    let cash_delta = after_account.cash.checked_sub(before_account.cash)?;
+    let realized_delta = after_account
+        .realized_pnl
+        .checked_sub(before_account.realized_pnl)?;
+    let sequence = next.replay_journal.last_seq();
+    let state_hash = next.state_hash();
+    *engine = next;
+
+    Ok(ApplyResult {
+        sequence,
+        changed_positions: vec![target.position_key],
+        realized_pnl_delta: realized_delta,
+        cash_delta,
+        state_hash,
+    })
 }
 
 fn correction_overrides(events: &[Event]) -> Result<BTreeMap<EventId, Option<Fill>>> {
