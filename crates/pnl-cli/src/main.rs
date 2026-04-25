@@ -4,7 +4,7 @@ use pnl_core::*;
 use std::fs::File;
 use std::path::PathBuf;
 
-mod replay_loader;
+mod input;
 
 #[derive(Debug, Parser)]
 #[command(name = "pnl-core")]
@@ -73,10 +73,9 @@ fn main() -> Result<()> {
 }
 
 fn replay(args: ReplayArgs) -> Result<()> {
-    let replay_loader::ReplayLoadResult {
-        engine,
-        replayed_events,
-    } = replay_loader::load_replay(&args.config, &args.instruments, &args.events)?;
+    let input::ReplayInput { mut engine, events } =
+        input::open_replay_input(&args.config, &args.instruments, &args.events)?;
+    let replayed_events = replay_events(&mut engine, events)?;
 
     let account_ids: Vec<_> = engine
         .positions()
@@ -136,4 +135,16 @@ fn replay(args: ReplayArgs) -> Result<()> {
         engine.write_snapshot_json(file)?;
     }
     Ok(())
+}
+
+fn replay_events(
+    engine: &mut Engine,
+    events: impl IntoIterator<Item = Result<Event>>,
+) -> Result<u64> {
+    let mut replayed = 0_u64;
+    for event in events {
+        engine.apply(event?)?;
+        replayed += 1;
+    }
+    Ok(replayed)
 }

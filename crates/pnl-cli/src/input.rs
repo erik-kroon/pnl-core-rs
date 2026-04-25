@@ -2,27 +2,30 @@ use anyhow::{Context, Result};
 use pnl_core::*;
 use serde::Deserialize;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-#[derive(Debug)]
-pub struct ReplayLoadResult {
+pub struct ReplayInput {
     pub engine: Engine,
-    pub replayed_events: u64,
+    pub events: EventIter<BufReader<File>>,
 }
 
-pub fn load_replay(config: &Path, instruments: &Path, events: &Path) -> Result<ReplayLoadResult> {
+pub fn open_replay_input(config: &Path, instruments: &Path, events: &Path) -> Result<ReplayInput> {
     let config = load_config(config)?;
     let base_currency = CurrencyId::from_code(&config.base_currency)?;
     let mut engine = build_engine(config, base_currency)?;
 
     load_instruments(&mut engine, instruments)?;
-    let replayed_events = apply_events(&mut engine, events, base_currency)?;
+    let events = open_events(events, base_currency, engine.config().account_money_scale)?;
 
-    Ok(ReplayLoadResult {
-        engine,
-        replayed_events,
-    })
+    Ok(ReplayInput { engine, events })
+}
+
+pub struct EventIter<R> {
+    lines: std::io::Lines<R>,
+    base_currency: CurrencyId,
+    money_scale: u8,
+    line_number: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,10 +167,14 @@ fn build_engine(config: CliConfig, base_currency: CurrencyId) -> Result<Engine> 
 }
 
 fn load_instruments(engine: &mut Engine, path: &Path) -> Result<()> {
-    let mut rdr =
+    let rdr =
         csv::Reader::from_path(path).with_context(|| format!("reading {}", path.display()))?;
-    for row in rdr.deserialize::<InstrumentRow>() {
-        let row = row?;
+    load_instrument_rows(engine, rdr)
+}
+
+fn load_instrument_rows<R: Read>(engine: &mut Engine, mut rdr: csv::Reader<R>) -> Result<()> {
+    for (idx, row) in rdr.deserialize::<InstrumentRow>().enumerate() {
+        let row = row.with_context(|| format!("parsing instruments row {}", idx + 1))?;
         let currency_id = CurrencyId::from_code(&row.currency)?;
         engine.register_currency(CurrencyMeta {
             currency_id,
@@ -186,31 +193,52 @@ fn load_instruments(engine: &mut Engine, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn apply_events(engine: &mut Engine, path: &Path, base_currency: CurrencyId) -> Result<u64> {
+fn open_events(
+    path: &Path,
+    base_currency: CurrencyId,
+    money_scale: u8,
+) -> Result<EventIter<BufReader<File>>> {
     let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let reader = BufReader::new(file);
-    apply_event_lines(engine, reader, base_currency)
+    Ok(event_lines(reader, base_currency, money_scale))
 }
 
-fn apply_event_lines<R: BufRead>(
-    engine: &mut Engine,
-    reader: R,
-    base_currency: CurrencyId,
-) -> Result<u64> {
-    let mut replayed = 0_u64;
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading events line {}", idx + 1))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let raw: RawEvent = serde_json::from_str(&line)
-            .with_context(|| format!("parsing events line {}", idx + 1))?;
-        let event = raw_event_to_core(raw, base_currency, engine.config().account_money_scale)
-            .with_context(|| format!("converting events line {}", idx + 1))?;
-        engine.apply(event)?;
-        replayed += 1;
+fn event_lines<R: BufRead>(reader: R, base_currency: CurrencyId, money_scale: u8) -> EventIter<R> {
+    EventIter {
+        lines: reader.lines(),
+        base_currency,
+        money_scale,
+        line_number: 0,
     }
-    Ok(replayed)
+}
+
+impl<R: BufRead> Iterator for EventIter<R> {
+    type Item = Result<Event>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = self.lines.next()?;
+            self.line_number += 1;
+            let line_number = self.line_number;
+            let line = match line.with_context(|| format!("reading events line {line_number}")) {
+                Ok(line) => line,
+                Err(error) => return Some(Err(error)),
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let raw: RawEvent = match serde_json::from_str(&line)
+                .with_context(|| format!("parsing events line {line_number}"))
+            {
+                Ok(raw) => raw,
+                Err(error) => return Some(Err(error)),
+            };
+            return Some(
+                raw_event_to_core(raw, self.base_currency, self.money_scale)
+                    .with_context(|| format!("converting events line {line_number}")),
+            );
+        }
+    }
 }
 
 fn raw_event_to_core(raw: RawEvent, base_currency: CurrencyId, money_scale: u8) -> Result<Event> {
@@ -317,51 +345,116 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn loads_fixture_replay() {
+    fn opens_fixture_replay_input() {
         let fixtures = fixture_dir();
-        let result = load_replay(
+        let ReplayInput { mut engine, events } = open_replay_input(
             &fixtures.join("config.toml"),
             &fixtures.join("instruments.csv"),
             &fixtures.join("events.ndjson"),
         )
         .unwrap();
 
-        assert_eq!(result.replayed_events, 5);
+        let mut replayed_events = 0_u64;
+        for event in events {
+            engine.apply(event.unwrap()).unwrap();
+            replayed_events += 1;
+        }
+
+        assert_eq!(replayed_events, 5);
         assert_eq!(
-            result
-                .engine
-                .account_summary(AccountId(1))
-                .unwrap()
-                .state_hash,
-            result.engine.state_hash()
+            engine.account_summary(AccountId(1)).unwrap().state_hash,
+            engine.state_hash()
         );
     }
 
     #[test]
     fn reports_event_conversion_line_context() {
-        let mut engine = build_engine(
-            CliConfig {
-                base_currency: "USD".to_string(),
-                account_money_scale: Some(4),
-                allow_short: None,
-                allow_position_flip: None,
-                expected_start_seq: None,
-                currencies: None,
-                accounts: None,
-                books: None,
-            },
-            CurrencyId::usd(),
-        )
-        .unwrap();
-
-        let error = apply_event_lines(
-            &mut engine,
+        let error = event_lines(
             Cursor::new("{\"seq\":1,\"type\":\"fill\",\"side\":\"hold\"}\n"),
             CurrencyId::usd(),
+            ACCOUNT_MONEY_SCALE,
         )
+        .next()
+        .unwrap()
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("converting events line 1"));
+    }
+
+    #[test]
+    fn reports_missing_event_fields_before_replay() {
+        let error = event_lines(
+            Cursor::new("{\"seq\":1,\"type\":\"initial_cash\",\"amount\":\"10\"}\n"),
+            CurrencyId::usd(),
+            ACCOUNT_MONEY_SCALE,
+        )
+        .next()
+        .unwrap()
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("converting events line 1"));
+        assert!(message.contains("missing required field account_id"));
+    }
+
+    #[test]
+    fn reports_missing_instrument_fields_before_replay() {
+        let mut engine = build_engine(default_config(), CurrencyId::usd()).unwrap();
+        let error = load_instrument_rows(
+            &mut engine,
+            csv::Reader::from_reader(Cursor::new(
+                "instrument_id,symbol,currency,price_scale,qty_scale,multiplier\n1,AAPL,USD,4,0\n",
+            )),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("parsing instruments row 1"));
+    }
+
+    #[test]
+    fn config_defaults_account_and_book() {
+        let mut engine = build_engine(default_config(), CurrencyId::usd()).unwrap();
+
+        engine
+            .register_instrument(InstrumentMeta {
+                instrument_id: InstrumentId(1),
+                symbol: "TEST".to_string(),
+                currency_id: CurrencyId::usd(),
+                price_scale: 4,
+                qty_scale: 0,
+                multiplier: FixedI128::one(),
+            })
+            .unwrap();
+
+        engine
+            .apply(Event {
+                seq: 1,
+                event_id: EventId(1),
+                ts_unix_ns: 1,
+                kind: EventKind::Fill(Fill {
+                    account_id: AccountId(1),
+                    book_id: BookId(1),
+                    instrument_id: InstrumentId(1),
+                    side: Side::Buy,
+                    qty: Qty::parse_decimal("1").unwrap(),
+                    price: Price::parse_decimal("1").unwrap(),
+                    fee: Money::zero(CurrencyId::usd(), ACCOUNT_MONEY_SCALE),
+                }),
+            })
+            .unwrap();
+    }
+
+    fn default_config() -> CliConfig {
+        CliConfig {
+            base_currency: "USD".to_string(),
+            account_money_scale: None,
+            allow_short: None,
+            allow_position_flip: None,
+            expected_start_seq: None,
+            currencies: None,
+            accounts: None,
+            books: None,
+        }
     }
 
     fn fixture_dir() -> PathBuf {
