@@ -1,5 +1,7 @@
+mod accounting;
 mod engine;
 mod error;
+pub(crate) mod replay_journal;
 mod snapshot;
 mod types;
 
