@@ -1,6 +1,6 @@
 use crate::engine::Engine;
 use crate::error::Result;
-use crate::snapshot::StateHash;
+use crate::state_hash::StateHash;
 use crate::summary::AccountSummary;
 use crate::types::*;
 use crate::valuation;

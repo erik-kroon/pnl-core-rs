@@ -1,209 +1,9 @@
 use pnl_core::*;
 use proptest::prelude::*;
 
-fn money(value: &str) -> Money {
-    Money::parse_decimal(value, CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
-}
+mod support;
 
-fn eur() -> CurrencyId {
-    CurrencyId::from_code("EUR").unwrap()
-}
-
-fn money_in(value: &str, currency_id: CurrencyId) -> Money {
-    Money::parse_decimal(value, currency_id, ACCOUNT_MONEY_SCALE).unwrap()
-}
-
-fn price(value: &str) -> Price {
-    Price::parse_decimal(value).unwrap()
-}
-
-fn setup() -> Engine {
-    let mut engine = Engine::new(EngineConfig::default());
-    engine
-        .register_currency(CurrencyMeta {
-            currency_id: CurrencyId::usd(),
-            code: "USD".to_string(),
-            scale: ACCOUNT_MONEY_SCALE,
-        })
-        .unwrap();
-    engine
-        .register_account(AccountMeta {
-            account_id: AccountId(1),
-            base_currency: CurrencyId::usd(),
-        })
-        .unwrap();
-    engine
-        .register_book(BookMeta {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-        })
-        .unwrap();
-    engine
-        .register_instrument(InstrumentMeta {
-            instrument_id: InstrumentId(1),
-            symbol: "AAPL".to_string(),
-            currency_id: CurrencyId::usd(),
-            price_scale: 4,
-            qty_scale: 0,
-            multiplier: FixedI128::one(),
-        })
-        .unwrap();
-    engine
-}
-
-fn setup_eur_instrument_usd_account() -> Engine {
-    let mut engine = Engine::new(EngineConfig::default());
-    for (currency_id, code) in [(CurrencyId::usd(), "USD"), (eur(), "EUR")] {
-        engine
-            .register_currency(CurrencyMeta {
-                currency_id,
-                code: code.to_string(),
-                scale: ACCOUNT_MONEY_SCALE,
-            })
-            .unwrap();
-    }
-    engine
-        .register_account(AccountMeta {
-            account_id: AccountId(1),
-            base_currency: CurrencyId::usd(),
-        })
-        .unwrap();
-    engine
-        .register_book(BookMeta {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-        })
-        .unwrap();
-    engine
-        .register_instrument(InstrumentMeta {
-            instrument_id: InstrumentId(1),
-            symbol: "SAP".to_string(),
-            currency_id: eur(),
-            price_scale: 4,
-            qty_scale: 0,
-            multiplier: FixedI128::one(),
-        })
-        .unwrap();
-    engine
-}
-
-fn initial(seq: u64, amount: &str) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::InitialCash(InitialCash {
-            account_id: AccountId(1),
-            currency_id: CurrencyId::usd(),
-            amount: money(amount),
-        }),
-    }
-}
-
-fn fx(seq: u64, from_currency_id: CurrencyId, to_currency_id: CurrencyId, rate: &str) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::FxRate(FxRateUpdate {
-            from_currency_id,
-            to_currency_id,
-            rate: price(rate),
-        }),
-    }
-}
-
-fn cash(seq: u64, amount: &str) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::CashAdjustment(CashAdjustment {
-            account_id: AccountId(1),
-            currency_id: CurrencyId::usd(),
-            amount: money(amount),
-            reason: Some("test".to_string()),
-        }),
-    }
-}
-
-fn fill(seq: u64, side: Side, qty: i128, px: &str, fee: &str) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::Fill(Fill {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-            side,
-            qty: Qty::from_units(qty),
-            price: price(px),
-            fee: money(fee),
-        }),
-    }
-}
-
-fn fill_fee_currency(
-    seq: u64,
-    side: Side,
-    qty: i128,
-    px: &str,
-    fee: &str,
-    fee_currency_id: CurrencyId,
-) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::Fill(Fill {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-            side,
-            qty: Qty::from_units(qty),
-            price: price(px),
-            fee: money_in(fee, fee_currency_id),
-        }),
-    }
-}
-
-fn mark(seq: u64, px: &str) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::Mark(MarkPriceUpdate {
-            instrument_id: InstrumentId(1),
-            price: price(px),
-        }),
-    }
-}
-
-fn correct_fill(seq: u64, original_event_id: EventId, replacement: Fill) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::TradeCorrection(TradeCorrection {
-            original_event_id,
-            replacement,
-            reason: Some("test correction".to_string()),
-        }),
-    }
-}
-
-fn bust_fill(seq: u64, original_event_id: EventId) -> Event {
-    Event {
-        seq,
-        event_id: EventId(seq),
-        ts_unix_ns: seq as i64,
-        kind: EventKind::TradeBust(TradeBust {
-            original_event_id,
-            reason: Some("test bust".to_string()),
-        }),
-    }
-}
+use support::*;
 
 #[test]
 fn open_long_and_mark_reconciles_cash_equity_and_pnl() {
@@ -214,7 +14,7 @@ fn open_long_and_mark_reconciles_cash_equity_and_pnl() {
         .unwrap();
     engine.apply(mark(3, "12.00")).unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.cash, money("8999.00"));
     assert_eq!(summary.position_market_value, money("1200.00"));
     assert_eq!(summary.equity, money("10199.00"));
@@ -236,7 +36,7 @@ fn cross_currency_fill_mark_and_fx_revalue_in_account_currency() {
         .unwrap();
     engine.apply(mark(4, "110.00")).unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.cash, money("8897.80"));
     assert_eq!(summary.position_market_value, money("1210.00"));
     assert_eq!(summary.equity, money("10107.80"));
@@ -247,7 +47,7 @@ fn cross_currency_fill_mark_and_fx_revalue_in_account_currency() {
     engine
         .apply(fx(5, eur(), CurrencyId::usd(), "1.20"))
         .unwrap();
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.position_market_value, money("1320.00"));
     assert_eq!(summary.equity, money("10217.80"));
     assert_eq!(summary.realized_pnl, money("-2.20"));
@@ -263,27 +63,13 @@ fn trade_correction_replays_replacement_fill_before_later_events() {
     engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
     engine.apply(fill(3, Side::Sell, 40, "12.00", "0")).unwrap();
 
-    let replacement = Fill {
-        account_id: AccountId(1),
-        book_id: BookId(1),
-        instrument_id: InstrumentId(1),
-        side: Side::Buy,
-        qty: Qty::from_units(100),
-        price: price("9.00"),
-        fee: money("0"),
-    };
+    let replacement = replacement_fill(Side::Buy, 100, "9.00", "0", CurrencyId::usd());
     engine
         .apply(correct_fill(4, EventId(2), replacement))
         .unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
-    let pos = engine
-        .position(PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        })
-        .unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let pos = engine.position(position_key()).unwrap();
     assert_eq!(pos.signed_qty, Qty::from_units(60));
     assert_eq!(pos.cost_basis, money("540.00"));
     assert_eq!(summary.realized_pnl, money("120.00"));
@@ -300,14 +86,8 @@ fn trade_bust_replays_without_original_fill() {
     engine.apply(mark(3, "12.00")).unwrap();
     engine.apply(bust_fill(4, EventId(2))).unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
-    assert!(engine
-        .position(PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        })
-        .is_none());
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    assert!(engine.position(position_key()).is_none());
     assert_eq!(summary.cash, money("10000.00"));
     assert_eq!(summary.realized_pnl, money("0.00"));
     assert_eq!(summary.unrealized_pnl, money("0.00"));
@@ -323,20 +103,12 @@ fn restored_snapshot_can_correct_prior_fill() {
     let mut bytes = Vec::new();
     engine.write_snapshot(&mut bytes).unwrap();
     let mut restored = Engine::read_snapshot(bytes.as_slice()).unwrap();
-    let replacement = Fill {
-        account_id: AccountId(1),
-        book_id: BookId(1),
-        instrument_id: InstrumentId(1),
-        side: Side::Buy,
-        qty: Qty::from_units(100),
-        price: price("9.00"),
-        fee: money("0"),
-    };
+    let replacement = replacement_fill(Side::Buy, 100, "9.00", "0", CurrencyId::usd());
     restored
         .apply(correct_fill(3, EventId(2), replacement))
         .unwrap();
 
-    let summary = restored.account_summary(AccountId(1)).unwrap();
+    let summary = restored.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.cash, money("9100.00"));
     assert_eq!(summary.equity, money("10000.00"));
     assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
@@ -371,14 +143,8 @@ fn cross_currency_close_realizes_pnl_at_current_fx_rate() {
         .unwrap();
     engine.apply(fill(5, Side::Sell, 4, "110.00", "0")).unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
-    let pos = engine
-        .position(PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        })
-        .unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let pos = engine.position(position_key()).unwrap();
     assert_eq!(pos.signed_qty, Qty::from_units(6));
     assert_eq!(pos.cost_basis, money("660.00"));
     assert_eq!(summary.cash, money("9428.00"));
@@ -394,11 +160,7 @@ fn add_partial_close_full_close_and_flat_avg_price() {
     engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
     engine.apply(fill(3, Side::Buy, 50, "12.00", "0")).unwrap();
 
-    let key = PositionKey {
-        account_id: AccountId(1),
-        book_id: BookId(1),
-        instrument_id: InstrumentId(1),
-    };
+    let key = position_key();
     let pos = engine.position(key).unwrap();
     assert_eq!(pos.signed_qty, Qty::from_units(150));
     assert_eq!(pos.avg_price, Some(Price::new(106_667, 4)));
@@ -428,14 +190,8 @@ fn long_to_short_flip_realizes_closed_quantity() {
         .apply(fill(3, Side::Sell, 150, "12.00", "0"))
         .unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
-    let pos = engine
-        .position(PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        })
-        .unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let pos = engine.position(position_key()).unwrap();
     assert_eq!(pos.signed_qty, Qty::from_units(-50));
     assert_eq!(
         pos.avg_price,
@@ -455,14 +211,8 @@ fn short_partial_close_realizes_profit() {
         .unwrap();
     engine.apply(fill(3, Side::Buy, 40, "18.00", "0")).unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
-    let pos = engine
-        .position(PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        })
-        .unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let pos = engine.position(position_key()).unwrap();
     assert_eq!(pos.signed_qty, Qty::from_units(-60));
     assert_eq!(summary.realized_pnl, money("80.00"));
     assert_eq!(summary.equity, money("10080.00"));
@@ -476,7 +226,7 @@ fn fees_and_rebates_flow_through_cash_and_realized_pnl() {
         .apply(fill(2, Side::Buy, 10, "10.00", "-0.50"))
         .unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.cash, money("900.50"));
     assert_eq!(summary.realized_pnl, money("0.50"));
     assert_eq!(summary.equity, money("1000.50"));
@@ -487,7 +237,7 @@ fn cash_adjustment_is_external_flow_not_pnl() {
     let mut engine = setup();
     engine.apply(initial(1, "1000.00")).unwrap();
     engine.apply(cash(2, "250.00")).unwrap();
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.cash, money("1250.00"));
     assert_eq!(summary.total_pnl, money("0.00"));
     assert_eq!(summary.net_external_cash_flows, money("250.00"));
@@ -500,7 +250,7 @@ fn account_summary_reports_leverage_and_open_positions() {
     engine.apply(initial(1, "1000.00")).unwrap();
     engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
 
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(
         summary.leverage,
         Some(Ratio {
@@ -513,7 +263,7 @@ fn account_summary_reports_leverage_and_open_positions() {
     engine
         .apply(fill(3, Side::Sell, 100, "10.00", "0"))
         .unwrap();
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.leverage, Some(Ratio::zero(ACCOUNT_RATIO_SCALE)));
     assert_eq!(summary.open_positions, 0);
 }
@@ -524,12 +274,12 @@ fn drawdown_updates_after_marks_and_recovers_peak() {
     engine.apply(initial(1, "10000.00")).unwrap();
     engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
     engine.apply(mark(3, "9.00")).unwrap();
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.current_drawdown, money("-100.00"));
     assert_eq!(summary.max_drawdown, money("-100.00"));
 
     engine.apply(mark(4, "11.00")).unwrap();
-    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
     assert_eq!(summary.peak_equity, money("10100.00"));
     assert_eq!(summary.current_drawdown, money("0.00"));
     assert_eq!(summary.max_drawdown, money("-100.00"));
@@ -550,7 +300,7 @@ fn reconciliation_invariant_holds_after_every_successful_event() {
     ] {
         let seq = event.seq;
         engine.apply(event).unwrap();
-        let summary = engine.account_summary(AccountId(1)).unwrap();
+        let summary = engine.account_summary(ACCOUNT).unwrap();
         assert_eq!(
             summary.pnl_reconciliation_delta,
             money("0.00"),
@@ -598,8 +348,8 @@ fn snapshot_restore_preserves_hash_and_corruption_fails() {
     let restored = Engine::read_snapshot(bytes.as_slice()).unwrap();
     assert_eq!(restored.state_hash(), hash);
     assert_eq!(
-        restored.account_summary(AccountId(1)).unwrap(),
-        engine.account_summary(AccountId(1)).unwrap()
+        restored.account_summary(ACCOUNT).unwrap(),
+        engine.account_summary(ACCOUNT).unwrap()
     );
 
     let last = bytes.len() - 1;
@@ -645,11 +395,7 @@ proptest! {
             let px = format!("{whole_price}.00");
             engine.apply(fill(seq, side, *qty as i128, &px, "0")).unwrap();
         }
-        let key = PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        };
+        let key = position_key();
         let position = engine.position(key).unwrap();
         prop_assert_eq!(position.signed_qty.value, expected_qty);
         if expected_qty == 0 {
@@ -658,7 +404,7 @@ proptest! {
             prop_assert!(position.avg_price.is_some());
         }
         prop_assert_eq!(
-            engine.account_summary(AccountId(1)).unwrap().pnl_reconciliation_delta,
+            engine.account_summary(ACCOUNT).unwrap().pnl_reconciliation_delta,
             money("0.00")
         );
     }

@@ -60,7 +60,8 @@ pub(super) fn read_snapshot<R: Read>(mut reader: R) -> Result<SnapshotV1> {
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
-    use crate::snapshot::{CanonicalStateV1, SnapshotMetadataV1, StateHash};
+    use crate::snapshot::SnapshotMetadataV1;
+    use crate::state_hash::{hash_canonical_state, CanonicalStateV1};
 
     fn minimal_snapshot() -> SnapshotV1 {
         let state = CanonicalStateV1 {
@@ -76,7 +77,7 @@ mod tests {
             event_log: Vec::new(),
             last_seq: 0,
         };
-        let state_hash = StateHash::from_canonical(&state);
+        let state_hash = hash_canonical_state(&state);
         SnapshotV1 {
             metadata: SnapshotMetadataV1 {
                 snapshot_sequence: 0,

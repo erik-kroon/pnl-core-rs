@@ -1,30 +1,14 @@
-mod canonical;
 mod codec;
 mod validation;
 
 use crate::engine::Engine;
 use crate::error::{Error, Result};
-pub use canonical::CanonicalStateV1;
+use crate::metadata::AccountMeta;
+use crate::registry::Registry;
+use crate::replay_journal::ReplayJournal;
+use crate::state_hash::{hash_canonical_state, CanonicalStateV1, StateHash};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateHash(pub [u8; 32]);
-
-impl StateHash {
-    pub const fn zero() -> Self {
-        Self([0; 32])
-    }
-
-    pub(crate) fn from_canonical(state: &CanonicalStateV1) -> Self {
-        let bytes = postcard::to_allocvec(state).expect("canonical state should serialize");
-        Self(*blake3::hash(&bytes).as_bytes())
-    }
-
-    pub fn to_hex(self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMetadataV1 {
@@ -39,10 +23,66 @@ pub struct SnapshotV1 {
     pub state: CanonicalStateV1,
 }
 
+impl CanonicalStateV1 {
+    fn into_engine(self) -> Engine {
+        let accounts = self.accounts;
+        let registry = Registry::from_parts(
+            self.currencies
+                .into_iter()
+                .map(|meta| (meta.currency_id, meta))
+                .collect(),
+            accounts
+                .iter()
+                .map(|account| {
+                    (
+                        account.account_id,
+                        AccountMeta {
+                            account_id: account.account_id,
+                            base_currency: account.base_currency,
+                        },
+                    )
+                })
+                .collect(),
+            self.books
+                .into_iter()
+                .map(|book| (book.account_id, book.book_id))
+                .collect(),
+            self.instruments
+                .into_iter()
+                .map(|meta| (meta.instrument_id, meta))
+                .collect(),
+        );
+        Engine {
+            config: self.config,
+            registry,
+            accounts: accounts
+                .into_iter()
+                .map(|account| (account.account_id, account))
+                .collect(),
+            positions: self.positions.into_iter().map(|p| (p.key, p)).collect(),
+            marks: self
+                .marks
+                .into_iter()
+                .map(|m| (m.instrument_id, m))
+                .collect(),
+            fx_rates: self
+                .fx_rates
+                .into_iter()
+                .map(|rate| ((rate.from_currency_id, rate.to_currency_id), rate))
+                .collect(),
+            replay_journal: ReplayJournal::from_parts(
+                self.seen_events.into_iter().collect(),
+                self.event_log,
+                self.last_seq,
+            ),
+        }
+    }
+}
+
 impl Engine {
     pub fn snapshot(&self) -> Result<SnapshotV1> {
         let state = CanonicalStateV1::from_engine(self);
-        let state_hash = StateHash::from_canonical(&state);
+        let state_hash = hash_canonical_state(&state);
         Ok(SnapshotV1 {
             metadata: SnapshotMetadataV1 {
                 snapshot_sequence: self.replay_journal.last_seq(),
@@ -54,7 +94,7 @@ impl Engine {
     }
 
     pub fn restore(snapshot: SnapshotV1) -> Result<Self> {
-        let hash = StateHash::from_canonical(&snapshot.state);
+        let hash = hash_canonical_state(&snapshot.state);
         if hash != snapshot.metadata.state_hash {
             return Err(Error::SnapshotHashMismatch);
         }
