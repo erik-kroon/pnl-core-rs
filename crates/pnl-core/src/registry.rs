@@ -1,5 +1,5 @@
-use crate::engine::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
 use crate::error::{Error, Result};
+use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

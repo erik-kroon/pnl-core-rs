@@ -1,13 +1,25 @@
+pub mod account;
 mod account_metrics;
 mod accounting;
-mod engine;
+pub mod config;
+pub mod engine;
 mod error;
+pub mod event;
+pub mod metadata;
+pub mod position;
 mod registry;
 pub(crate) mod replay_journal;
 mod snapshot;
+pub mod summary;
 mod types;
 
+pub use crate::account::*;
+pub use crate::config::*;
 pub use crate::engine::*;
 pub use crate::error::{Error, Result};
+pub use crate::event::*;
+pub use crate::metadata::*;
+pub use crate::position::*;
 pub use crate::snapshot::{SnapshotMetadataV1, SnapshotV1, StateHash};
+pub use crate::summary::*;
 pub use crate::types::*;

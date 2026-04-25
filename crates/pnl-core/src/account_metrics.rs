@@ -1,6 +1,7 @@
-use crate::engine::{AccountSummary, Engine};
+use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::snapshot::StateHash;
+use crate::summary::AccountSummary;
 use crate::types::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,10 +119,9 @@ impl AccountMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{
-        AccountMeta, BookMeta, EngineConfig, Event, EventKind, Fill, InitialCash, InstrumentMeta,
-        MarkPriceUpdate,
-    };
+    use crate::config::EngineConfig;
+    use crate::event::{Event, EventKind, Fill, InitialCash, MarkPriceUpdate};
+    use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
 
     fn money(value: &str) -> Money {
         Money::parse_decimal(value, CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
@@ -134,7 +134,7 @@ mod tests {
     fn setup() -> Engine {
         let mut engine = Engine::new(EngineConfig::default());
         engine
-            .register_currency(crate::engine::CurrencyMeta {
+            .register_currency(CurrencyMeta {
                 currency_id: CurrencyId::usd(),
                 code: "USD".to_string(),
                 scale: ACCOUNT_MONEY_SCALE,
