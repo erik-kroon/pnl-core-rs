@@ -15,7 +15,80 @@ use crate::summary::{AccountSummary, ApplyResult};
 use crate::types::*;
 use crate::valuation::{self, ValuationConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+
+mod accounting_effect {
+    use crate::position::PositionKey;
+    use crate::snapshot::StateHash;
+    use crate::summary::ApplyResult;
+    use crate::types::{AccountId, Money};
+    use std::collections::BTreeSet;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AccountingEffect {
+        pub(crate) state: AccountingStateChanges,
+        pub(crate) follow_up: AccountingFollowUp,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AccountingStateChanges {
+        pub(crate) changed_positions: Vec<PositionKey>,
+        pub(crate) cash_delta: Money,
+        pub(crate) realized_pnl_delta: Money,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AccountingFollowUp {
+        pub(crate) drawdown_accounts: BTreeSet<AccountId>,
+    }
+
+    impl AccountingEffect {
+        pub(crate) fn new(zero: Money) -> Self {
+            Self {
+                state: AccountingStateChanges {
+                    changed_positions: Vec::new(),
+                    cash_delta: zero,
+                    realized_pnl_delta: zero,
+                },
+                follow_up: AccountingFollowUp {
+                    drawdown_accounts: BTreeSet::new(),
+                },
+            }
+        }
+
+        pub(crate) fn record_changed_position(&mut self, key: PositionKey) {
+            self.state.changed_positions.push(key);
+        }
+
+        pub(crate) fn record_cash_delta(&mut self, delta: Money) {
+            self.state.cash_delta = delta;
+        }
+
+        pub(crate) fn record_realized_pnl_delta(&mut self, delta: Money) {
+            self.state.realized_pnl_delta = delta;
+        }
+
+        pub(crate) fn require_drawdown_update(&mut self, account_id: AccountId) {
+            self.follow_up.drawdown_accounts.insert(account_id);
+        }
+
+        pub(crate) fn drawdown_accounts(&self) -> impl Iterator<Item = AccountId> + '_ {
+            self.follow_up.drawdown_accounts.iter().copied()
+        }
+
+        pub(crate) fn into_apply_result(self, sequence: u64, state_hash: StateHash) -> ApplyResult {
+            ApplyResult {
+                sequence,
+                changed_positions: self.state.changed_positions,
+                realized_pnl_delta: self.state.realized_pnl_delta,
+                cash_delta: self.state.cash_delta,
+                state_hash,
+            }
+        }
+    }
+}
+
+pub(crate) use accounting_effect::AccountingEffect;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Engine {
@@ -120,12 +193,9 @@ impl Engine {
         &mut self,
         event: &Event,
         kind: &EventKind,
-    ) -> Result<(Vec<PositionKey>, Money, Money, BTreeSet<AccountId>)> {
+    ) -> Result<AccountingEffect> {
         let zero = Money::zero(self.config.base_currency, self.config.account_money_scale);
-        let mut changed_positions = Vec::new();
-        let mut cash_delta = zero;
-        let mut realized_delta = zero;
-        let mut drawdown_accounts = BTreeSet::new();
+        let mut effect = AccountingEffect::new(zero);
 
         match kind {
             EventKind::InitialCash(initial) => {
@@ -142,8 +212,8 @@ impl Engine {
                 account.initial_cash = initial.amount;
                 account.cash = initial.amount;
                 account.initial_cash_set = true;
-                cash_delta = delta;
-                drawdown_accounts.insert(initial.account_id);
+                effect.record_cash_delta(delta);
+                effect.require_drawdown_update(initial.account_id);
             }
             EventKind::CashAdjustment(adj) => {
                 self.registry.ensure_account(adj.account_id)?;
@@ -158,41 +228,26 @@ impl Engine {
                 account.cash = account.cash.checked_add(adj.amount)?;
                 account.net_external_cash_flows =
                     account.net_external_cash_flows.checked_add(adj.amount)?;
-                cash_delta = adj.amount;
-                drawdown_accounts.insert(adj.account_id);
+                effect.record_cash_delta(adj.amount);
+                effect.require_drawdown_update(adj.account_id);
             }
             EventKind::Fill(fill) => {
                 let (changed, c_delta, r_delta) = self.apply_fill(fill, event.ts_unix_ns)?;
-                changed_positions.push(changed);
-                cash_delta = c_delta;
-                realized_delta = r_delta;
-                drawdown_accounts.insert(fill.account_id);
+                effect.record_changed_position(changed);
+                effect.record_cash_delta(c_delta);
+                effect.record_realized_pnl_delta(r_delta);
+                effect.require_drawdown_update(fill.account_id);
             }
             EventKind::Mark(mark) => {
-                self.apply_mark(
-                    mark,
-                    event.ts_unix_ns,
-                    &mut changed_positions,
-                    &mut drawdown_accounts,
-                )?;
+                self.apply_mark(mark, event.ts_unix_ns, &mut effect)?;
             }
             EventKind::FxRate(fx) => {
-                self.apply_fx_rate(
-                    fx,
-                    event.ts_unix_ns,
-                    &mut changed_positions,
-                    &mut drawdown_accounts,
-                )?;
+                self.apply_fx_rate(fx, event.ts_unix_ns, &mut effect)?;
             }
             EventKind::TradeCorrection(_) | EventKind::TradeBust(_) => {}
         }
 
-        Ok((
-            changed_positions,
-            cash_delta,
-            realized_delta,
-            drawdown_accounts,
-        ))
+        Ok(effect)
     }
 
     pub(super) fn reset_accounting_state_for_replay(&mut self) {
@@ -267,8 +322,7 @@ impl Engine {
         &mut self,
         mark: &MarkPriceUpdate,
         ts_unix_ns: i64,
-        changed_positions: &mut Vec<PositionKey>,
-        drawdown_accounts: &mut BTreeSet<AccountId>,
+        effect: &mut AccountingEffect,
     ) -> Result<()> {
         let instrument = self.registry.instrument(mark.instrument_id)?.clone();
         let valuation_config = self.valuation_config();
@@ -294,8 +348,8 @@ impl Engine {
                 &self.fx_rates,
                 valuation_config,
             )?;
-            drawdown_accounts.insert(key.account_id);
-            changed_positions.push(key);
+            effect.require_drawdown_update(key.account_id);
+            effect.record_changed_position(key);
             self.positions.insert(key, position);
         }
         Ok(())
@@ -305,8 +359,7 @@ impl Engine {
         &mut self,
         fx: &FxRateUpdate,
         ts_unix_ns: i64,
-        changed_positions: &mut Vec<PositionKey>,
-        drawdown_accounts: &mut BTreeSet<AccountId>,
+        effect: &mut AccountingEffect,
     ) -> Result<()> {
         self.registry.ensure_currency(fx.from_currency_id)?;
         self.registry.ensure_currency(fx.to_currency_id)?;
@@ -333,9 +386,16 @@ impl Engine {
                 &self.fx_rates,
                 valuation_config,
             )?;
-            drawdown_accounts.insert(key.account_id);
-            changed_positions.push(key);
+            effect.require_drawdown_update(key.account_id);
+            effect.record_changed_position(key);
             self.positions.insert(key, position);
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_accounting_follow_up(&mut self, effect: &AccountingEffect) -> Result<()> {
+        for account_id in effect.drawdown_accounts() {
+            self.update_drawdown(account_id)?;
         }
         Ok(())
     }
@@ -351,5 +411,127 @@ impl Engine {
             account.max_drawdown = account.current_drawdown;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::InitialCash;
+    use std::collections::BTreeSet;
+
+    fn money(value: &str) -> Money {
+        Money::parse_decimal(value, CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
+    }
+
+    fn price(value: &str) -> Price {
+        Price::parse_decimal(value).unwrap()
+    }
+
+    fn setup() -> Engine {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine
+            .register_currency(CurrencyMeta {
+                currency_id: CurrencyId::usd(),
+                code: "USD".to_string(),
+                scale: ACCOUNT_MONEY_SCALE,
+            })
+            .unwrap();
+        engine
+            .register_account(AccountMeta {
+                account_id: AccountId(1),
+                base_currency: CurrencyId::usd(),
+            })
+            .unwrap();
+        engine
+            .register_book(BookMeta {
+                account_id: AccountId(1),
+                book_id: BookId(1),
+            })
+            .unwrap();
+        engine
+            .register_instrument(InstrumentMeta {
+                instrument_id: InstrumentId(1),
+                symbol: "AAPL".to_string(),
+                currency_id: CurrencyId::usd(),
+                price_scale: 4,
+                qty_scale: 0,
+                multiplier: FixedI128::one(),
+            })
+            .unwrap();
+        engine
+    }
+
+    fn initial_cash_event(amount: &str) -> Event {
+        Event {
+            seq: 1,
+            event_id: EventId(1),
+            ts_unix_ns: 1,
+            kind: EventKind::InitialCash(InitialCash {
+                account_id: AccountId(1),
+                currency_id: CurrencyId::usd(),
+                amount: money(amount),
+            }),
+        }
+    }
+
+    fn fill_event() -> Event {
+        Event {
+            seq: 2,
+            event_id: EventId(2),
+            ts_unix_ns: 2,
+            kind: EventKind::Fill(Fill {
+                account_id: AccountId(1),
+                book_id: BookId(1),
+                instrument_id: InstrumentId(1),
+                side: Side::Buy,
+                qty: Qty::from_units(100),
+                price: price("10.00"),
+                fee: money("1.00"),
+            }),
+        }
+    }
+
+    #[test]
+    fn initial_cash_effect_names_state_changes_and_follow_up() {
+        let mut engine = setup();
+        let event = initial_cash_event("1000.00");
+
+        let effect = engine.apply_accounting_effect(&event, &event.kind).unwrap();
+
+        assert_eq!(effect.state.changed_positions, Vec::new());
+        assert_eq!(effect.state.cash_delta, money("1000.00"));
+        assert_eq!(effect.state.realized_pnl_delta, money("0.00"));
+        assert_eq!(
+            effect.follow_up.drawdown_accounts,
+            BTreeSet::from([AccountId(1)])
+        );
+    }
+
+    #[test]
+    fn fill_effect_names_position_and_account_changes() {
+        let mut engine = setup();
+        let initial = initial_cash_event("2000.00");
+        engine
+            .apply_accounting_effect(&initial, &initial.kind)
+            .unwrap();
+        let event = fill_event();
+
+        let effect = engine.apply_accounting_effect(&event, &event.kind).unwrap();
+
+        assert_eq!(
+            effect.state.changed_positions,
+            vec![PositionKey {
+                account_id: AccountId(1),
+                book_id: BookId(1),
+                instrument_id: InstrumentId(1),
+            }]
+        );
+        assert_eq!(effect.state.cash_delta, money("-1001.00"));
+        assert_eq!(effect.state.realized_pnl_delta, money("-1.00"));
+        assert_eq!(
+            effect.follow_up.drawdown_accounts,
+            BTreeSet::from([AccountId(1)])
+        );
     }
 }

@@ -143,10 +143,8 @@ impl ReplayJournal {
                 _ => &event.kind,
             };
 
-            let (_, _, _, drawdown_accounts) = engine.apply_accounting_effect(event, kind)?;
-            for account_id in drawdown_accounts {
-                engine.update_drawdown(account_id)?;
-            }
+            let effect = engine.apply_accounting_effect(event, kind)?;
+            engine.apply_accounting_follow_up(&effect)?;
             self.record_replayed_event(event);
         }
 
@@ -197,20 +195,11 @@ impl ReplayJournal {
 }
 
 fn apply_accounting_event(engine: &mut Engine, event: Event) -> Result<ApplyResult> {
-    let (changed_positions, cash_delta, realized_delta, drawdown_accounts) =
-        engine.apply_accounting_effect(&event, &event.kind)?;
-    for account_id in drawdown_accounts {
-        engine.update_drawdown(account_id)?;
-    }
+    let effect = engine.apply_accounting_effect(&event, &event.kind)?;
+    engine.apply_accounting_follow_up(&effect)?;
 
     engine.replay_journal.record_accepted(event);
-    Ok(ApplyResult {
-        sequence: engine.replay_journal.last_seq(),
-        changed_positions,
-        realized_pnl_delta: realized_delta,
-        cash_delta,
-        state_hash: engine.state_hash(),
-    })
+    Ok(effect.into_apply_result(engine.replay_journal.last_seq(), engine.state_hash()))
 }
 
 fn apply_history_rewrite(engine: &mut Engine, event: Event) -> Result<ApplyResult> {
