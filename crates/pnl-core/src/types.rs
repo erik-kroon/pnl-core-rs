@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const ACCOUNT_MONEY_SCALE: u8 = 4;
+pub const ACCOUNT_RATIO_SCALE: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AccountId(pub u64);
@@ -273,6 +274,29 @@ pub struct Ratio {
 impl Ratio {
     pub const fn zero(scale: u8) -> Self {
         Self { value: 0, scale }
+    }
+
+    pub fn from_fraction(
+        numer: i128,
+        denom: i128,
+        scale: u8,
+        rounding: RoundingMode,
+    ) -> Result<Self> {
+        if denom == 0 {
+            return Err(Error::DivisionByZero);
+        }
+        let factor = checked_pow10(scale)?;
+        let scaled = numer.checked_mul(factor).ok_or(Error::ArithmeticOverflow)?;
+        Ok(Self {
+            value: div_round(scaled, denom, rounding)?,
+            scale,
+        })
+    }
+}
+
+impl fmt::Display for Ratio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_scaled(self.value, self.scale, f)
     }
 }
 

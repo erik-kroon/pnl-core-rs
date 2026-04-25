@@ -495,6 +495,30 @@ fn cash_adjustment_is_external_flow_not_pnl() {
 }
 
 #[test]
+fn account_summary_reports_leverage_and_open_positions() {
+    let mut engine = setup();
+    engine.apply(initial(1, "1000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    assert_eq!(
+        summary.leverage,
+        Some(Ratio {
+            value: 10_000,
+            scale: ACCOUNT_RATIO_SCALE
+        })
+    );
+    assert_eq!(summary.open_positions, 1);
+
+    engine
+        .apply(fill(3, Side::Sell, 100, "10.00", "0"))
+        .unwrap();
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    assert_eq!(summary.leverage, Some(Ratio::zero(ACCOUNT_RATIO_SCALE)));
+    assert_eq!(summary.open_positions, 0);
+}
+
+#[test]
 fn drawdown_updates_after_marks_and_recovers_peak() {
     let mut engine = setup();
     engine.apply(initial(1, "10000.00")).unwrap();

@@ -2,7 +2,7 @@
 
 Deterministic fixed-point PnL, position, and exposure accounting for real-time trading systems.
 
-`pnl-core-rs` turns strict ordered accounting events into replayable portfolio state: cash, positions, realized PnL, unrealized PnL, exposure, equity, drawdown, snapshots, and deterministic state hashes.
+`pnl-core-rs` turns strict ordered accounting events into replayable portfolio state: cash, positions, realized PnL, unrealized PnL, exposure, equity, leverage, drawdown, snapshots, and deterministic state hashes.
 
 ## V1 Scope
 
@@ -13,6 +13,7 @@ V1 is intentionally narrow:
 - Typed IDs for accounts, books, instruments, currencies, and events.
 - Cash-authoritative accounting.
 - Average-cost position accounting.
+- Account summaries with gross exposure, net exposure, equity, leverage, open-position count, drawdown, and reconciliation delta.
 - Trade corrections and busts through deterministic historical replay.
 - Fixed-point `i128` arithmetic with account money scale `4`.
 - Strict contiguous event replay.

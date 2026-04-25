@@ -263,6 +263,11 @@ fn replay(args: ReplayArgs) -> Result<()> {
         println!("Total PnL:              {}", summary.total_pnl);
         println!("Gross exposure:         {}", summary.gross_exposure);
         println!("Net exposure:           {}", summary.net_exposure);
+        match summary.leverage {
+            Some(leverage) => println!("Leverage:               {leverage}"),
+            None => println!("Leverage:               n/a"),
+        }
+        println!("Open positions:         {}", summary.open_positions);
         println!("Current drawdown:       {}", summary.current_drawdown);
         println!("Max drawdown:           {}", summary.max_drawdown);
         println!(

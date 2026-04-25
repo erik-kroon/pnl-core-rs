@@ -193,6 +193,7 @@ pub struct ApplyResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSummary {
     pub account_id: AccountId,
+    pub base_currency: CurrencyId,
     pub cash: Money,
     pub position_market_value: Money,
     pub equity: Money,
@@ -201,9 +202,11 @@ pub struct AccountSummary {
     pub total_pnl: Money,
     pub gross_exposure: Money,
     pub net_exposure: Money,
+    pub leverage: Option<Ratio>,
     pub peak_equity: Money,
     pub current_drawdown: Money,
     pub max_drawdown: Money,
+    pub open_positions: u32,
     pub net_external_cash_flows: Money,
     pub pnl_reconciliation_delta: Money,
     pub state_hash: StateHash,
@@ -342,23 +345,40 @@ impl Engine {
         let mut gross = zero;
         let mut net = zero;
         let mut unrealized = zero;
+        let mut open_positions = 0_u32;
         for position in self
             .positions
             .values()
             .filter(|p| p.key.account_id == account_id)
         {
+            if position.signed_qty.value != 0 {
+                open_positions = open_positions
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
             gross = gross.checked_add(position.gross_exposure)?;
             net = net.checked_add(position.net_exposure)?;
             unrealized = unrealized.checked_add(position.unrealized_pnl)?;
         }
         let equity = account.cash.checked_add(net)?;
         let total_pnl = account.realized_pnl.checked_add(unrealized)?;
+        let leverage = if equity.amount > 0 {
+            Some(Ratio::from_fraction(
+                gross.amount,
+                equity.amount,
+                ACCOUNT_RATIO_SCALE,
+                self.config.rounding_mode,
+            )?)
+        } else {
+            None
+        };
         let expected_pnl = equity
             .checked_sub(account.initial_cash)?
             .checked_sub(account.net_external_cash_flows)?;
         let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
         Ok(AccountSummary {
             account_id,
+            base_currency: account.base_currency,
             cash: account.cash,
             position_market_value: net,
             equity,
@@ -367,9 +387,11 @@ impl Engine {
             total_pnl,
             gross_exposure: gross,
             net_exposure: net,
+            leverage,
             peak_equity: account.peak_equity,
             current_drawdown: account.current_drawdown,
             max_drawdown: account.max_drawdown,
+            open_positions,
             net_external_cash_flows: account.net_external_cash_flows,
             pnl_reconciliation_delta,
             state_hash: self.state_hash(),
@@ -860,23 +882,40 @@ impl Engine {
         let mut gross = zero;
         let mut net = zero;
         let mut unrealized = zero;
+        let mut open_positions = 0_u32;
         for position in self
             .positions
             .values()
             .filter(|p| p.key.account_id == account_id)
         {
+            if position.signed_qty.value != 0 {
+                open_positions = open_positions
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
             gross = gross.checked_add(position.gross_exposure)?;
             net = net.checked_add(position.net_exposure)?;
             unrealized = unrealized.checked_add(position.unrealized_pnl)?;
         }
         let equity = account.cash.checked_add(net)?;
         let total_pnl = account.realized_pnl.checked_add(unrealized)?;
+        let leverage = if equity.amount > 0 {
+            Some(Ratio::from_fraction(
+                gross.amount,
+                equity.amount,
+                ACCOUNT_RATIO_SCALE,
+                self.config.rounding_mode,
+            )?)
+        } else {
+            None
+        };
         let expected_pnl = equity
             .checked_sub(account.initial_cash)?
             .checked_sub(account.net_external_cash_flows)?;
         let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
         Ok(AccountSummary {
             account_id,
+            base_currency: account.base_currency,
             cash: account.cash,
             position_market_value: net,
             equity,
@@ -885,9 +924,11 @@ impl Engine {
             total_pnl,
             gross_exposure: gross,
             net_exposure: net,
+            leverage,
             peak_equity: account.peak_equity,
             current_drawdown: account.current_drawdown,
             max_drawdown: account.max_drawdown,
+            open_positions,
             net_external_cash_flows: account.net_external_cash_flows,
             pnl_reconciliation_delta,
             state_hash: StateHash::zero(),
