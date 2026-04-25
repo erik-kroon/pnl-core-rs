@@ -2,6 +2,7 @@ mod account_metrics;
 mod accounting;
 mod engine;
 mod error;
+mod registry;
 pub(crate) mod replay_journal;
 mod snapshot;
 mod types;

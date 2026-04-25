@@ -26,10 +26,8 @@ pub(crate) struct AccountMetrics {
 
 impl AccountMetrics {
     pub(crate) fn compute(engine: &Engine, account_id: AccountId) -> Result<Self> {
-        let account = engine
-            .accounts
-            .get(&account_id)
-            .ok_or(Error::UnknownAccount(account_id))?;
+        engine.registry.ensure_account(account_id)?;
+        let account = engine.accounts.get(&account_id).unwrap();
         let zero = Money::zero(account.base_currency, engine.config.account_money_scale);
         let mut gross = zero;
         let mut net = zero;
