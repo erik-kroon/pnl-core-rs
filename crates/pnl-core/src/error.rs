@@ -15,6 +15,8 @@ pub enum Error {
     UnknownInstrument(InstrumentId),
     #[error("unknown currency {0:?}")]
     UnknownCurrency(CurrencyId),
+    #[error("{0}")]
+    RegistrationConflict(&'static str),
     #[error("duplicate event {0:?}")]
     DuplicateEvent(EventId),
     #[error("unknown original event {0:?}")]

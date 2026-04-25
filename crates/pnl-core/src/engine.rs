@@ -1,5 +1,6 @@
 use crate::accounting::{apply_average_cost_fill, AverageCostFill};
 use crate::error::{Error, Result};
+use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
 use crate::snapshot::{CanonicalStateV1, StateHash};
 use crate::types::*;
@@ -217,10 +218,8 @@ pub struct AccountSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Engine {
     pub(crate) config: EngineConfig,
-    pub(crate) currencies: BTreeMap<CurrencyId, CurrencyMeta>,
+    pub(crate) registry: Registry,
     pub(crate) accounts: BTreeMap<AccountId, AccountState>,
-    pub(crate) books: BTreeSet<(AccountId, BookId)>,
-    pub(crate) instruments: BTreeMap<InstrumentId, InstrumentMeta>,
     pub(crate) positions: BTreeMap<PositionKey, Position>,
     pub(crate) marks: BTreeMap<InstrumentId, Mark>,
     pub(crate) fx_rates: BTreeMap<(CurrencyId, CurrencyId), FxRate>,
@@ -231,10 +230,8 @@ impl Engine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
-            currencies: BTreeMap::new(),
+            registry: Registry::new(),
             accounts: BTreeMap::new(),
-            books: BTreeSet::new(),
-            instruments: BTreeMap::new(),
             positions: BTreeMap::new(),
             marks: BTreeMap::new(),
             fx_rates: BTreeMap::new(),
@@ -251,15 +248,15 @@ impl Engine {
     }
 
     pub fn register_currency(&mut self, meta: CurrencyMeta) -> Result<()> {
-        if meta.scale != self.config.account_money_scale {
-            return Err(Error::InvalidScale);
-        }
-        self.currencies.insert(meta.currency_id, meta);
-        Ok(())
+        self.registry
+            .register_currency(meta, self.config.account_money_scale)
     }
 
     pub fn register_account(&mut self, meta: AccountMeta) -> Result<()> {
-        self.ensure_currency(meta.base_currency)?;
+        let inserted = self.registry.register_account(meta.clone())?;
+        if !inserted {
+            return Ok(());
+        }
         let zero = Money::zero(meta.base_currency, self.config.account_money_scale);
         self.accounts.insert(
             meta.account_id,
@@ -280,18 +277,11 @@ impl Engine {
     }
 
     pub fn register_book(&mut self, meta: BookMeta) -> Result<()> {
-        self.ensure_account(meta.account_id)?;
-        self.books.insert((meta.account_id, meta.book_id));
-        Ok(())
+        self.registry.register_book(meta)
     }
 
     pub fn register_instrument(&mut self, meta: InstrumentMeta) -> Result<()> {
-        self.ensure_currency(meta.currency_id)?;
-        if meta.multiplier.value <= 0 {
-            return Err(Error::InvalidScale);
-        }
-        self.instruments.insert(meta.instrument_id, meta);
-        Ok(())
+        self.registry.register_instrument(meta)
     }
 
     pub fn apply_many(
@@ -310,7 +300,7 @@ impl Engine {
     }
 
     pub fn account_summary(&self, account_id: AccountId) -> Result<AccountSummary> {
-        self.ensure_account(account_id)?;
+        self.registry.ensure_account(account_id)?;
         let account = self.accounts.get(&account_id).unwrap();
         let zero = Money::zero(account.base_currency, self.config.account_money_scale);
         let mut gross = zero;
@@ -386,9 +376,14 @@ impl Engine {
 
         match kind {
             EventKind::InitialCash(initial) => {
-                self.ensure_account(initial.account_id)?;
-                self.ensure_money(initial.amount, initial.currency_id)?;
-                self.ensure_account_currency(initial.account_id, initial.currency_id)?;
+                self.registry.ensure_account(initial.account_id)?;
+                self.registry.ensure_money(
+                    initial.amount,
+                    initial.currency_id,
+                    self.config.account_money_scale,
+                )?;
+                self.registry
+                    .ensure_account_currency(initial.account_id, initial.currency_id)?;
                 let account = self.accounts.get_mut(&initial.account_id).unwrap();
                 let delta = initial.amount.checked_sub(account.cash)?;
                 account.initial_cash = initial.amount;
@@ -398,9 +393,14 @@ impl Engine {
                 drawdown_accounts.insert(initial.account_id);
             }
             EventKind::CashAdjustment(adj) => {
-                self.ensure_account(adj.account_id)?;
-                self.ensure_money(adj.amount, adj.currency_id)?;
-                self.ensure_account_currency(adj.account_id, adj.currency_id)?;
+                self.registry.ensure_account(adj.account_id)?;
+                self.registry.ensure_money(
+                    adj.amount,
+                    adj.currency_id,
+                    self.config.account_money_scale,
+                )?;
+                self.registry
+                    .ensure_account_currency(adj.account_id, adj.currency_id)?;
                 let account = self.accounts.get_mut(&adj.account_id).unwrap();
                 account.cash = account.cash.checked_add(adj.amount)?;
                 account.net_external_cash_flows =
@@ -460,11 +460,15 @@ impl Engine {
     }
 
     fn apply_fill(&mut self, fill: &Fill, ts_unix_ns: i64) -> Result<(PositionKey, Money, Money)> {
-        self.ensure_account(fill.account_id)?;
-        self.ensure_book(fill.account_id, fill.book_id)?;
-        let instrument = self.ensure_instrument(fill.instrument_id)?.clone();
-        let account_currency = self.accounts.get(&fill.account_id).unwrap().base_currency;
-        self.ensure_money(fill.fee, fill.fee.currency_id)?;
+        self.registry.ensure_account(fill.account_id)?;
+        self.registry.ensure_book(fill.account_id, fill.book_id)?;
+        let instrument = self.registry.instrument(fill.instrument_id)?.clone();
+        let account_currency = self.registry.account_currency(fill.account_id)?;
+        self.registry.ensure_money(
+            fill.fee,
+            fill.fee.currency_id,
+            self.config.account_money_scale,
+        )?;
         let fee = self.convert_money(fill.fee, account_currency)?;
         let qty = fill.qty.to_scale_exact(instrument.qty_scale)?;
         if qty.value <= 0 {
@@ -532,7 +536,7 @@ impl Engine {
         changed_positions: &mut Vec<PositionKey>,
         drawdown_accounts: &mut BTreeSet<AccountId>,
     ) -> Result<()> {
-        let instrument = self.ensure_instrument(mark.instrument_id)?.clone();
+        let instrument = self.registry.instrument(mark.instrument_id)?.clone();
         let price = mark
             .price
             .to_scale(instrument.price_scale, self.config.rounding_mode)?;
@@ -543,7 +547,7 @@ impl Engine {
             .filter(|key| key.instrument_id == mark.instrument_id)
             .collect();
         for key in &keys {
-            let account_currency = self.accounts.get(&key.account_id).unwrap().base_currency;
+            let account_currency = self.registry.account_currency(key.account_id)?;
             self.ensure_conversion_rate(instrument.currency_id, account_currency)?;
         }
 
@@ -572,8 +576,8 @@ impl Engine {
         changed_positions: &mut Vec<PositionKey>,
         drawdown_accounts: &mut BTreeSet<AccountId>,
     ) -> Result<()> {
-        self.ensure_currency(fx.from_currency_id)?;
-        self.ensure_currency(fx.to_currency_id)?;
+        self.registry.ensure_currency(fx.from_currency_id)?;
+        self.registry.ensure_currency(fx.to_currency_id)?;
         if fx.rate.value <= 0 {
             return Err(Error::InvalidPrice);
         }
@@ -593,18 +597,17 @@ impl Engine {
             .keys()
             .copied()
             .filter(|key| {
-                let Some(instrument) = self.instruments.get(&key.instrument_id) else {
-                    return false;
-                };
-                let Some(account) = self.accounts.get(&key.account_id) else {
-                    return false;
-                };
-                instrument.currency_id == fx.from_currency_id
-                    && account.base_currency == fx.to_currency_id
+                self.registry
+                    .instrument(key.instrument_id)
+                    .is_ok_and(|instrument| instrument.currency_id == fx.from_currency_id)
+                    && self
+                        .registry
+                        .account_currency(key.account_id)
+                        .is_ok_and(|currency| currency == fx.to_currency_id)
             })
             .collect();
         for key in keys {
-            let instrument = self.instruments.get(&key.instrument_id).unwrap().clone();
+            let instrument = self.registry.instrument(key.instrument_id)?.clone();
             let mut position = self.positions.remove(&key).unwrap();
             self.revalue_position(&mut position, &instrument)?;
             drawdown_accounts.insert(key.account_id);
@@ -615,11 +618,7 @@ impl Engine {
     }
 
     fn revalue_position(&self, position: &mut Position, instrument: &InstrumentMeta) -> Result<()> {
-        let account_currency = self
-            .accounts
-            .get(&position.key.account_id)
-            .ok_or(Error::UnknownAccount(position.key.account_id))?
-            .base_currency;
+        let account_currency = self.registry.account_currency(position.key.account_id)?;
         let zero = Money::zero(account_currency, self.config.account_money_scale);
         if position.signed_qty.value == 0 {
             position.unrealized_pnl = zero;
@@ -661,7 +660,7 @@ impl Engine {
     }
 
     fn account_summary_without_hash(&self, account_id: AccountId) -> Result<AccountSummary> {
-        self.ensure_account(account_id)?;
+        self.registry.ensure_account(account_id)?;
         let account = self.accounts.get(&account_id).unwrap();
         let zero = Money::zero(account.base_currency, self.config.account_money_scale);
         let mut gross = zero;
@@ -718,62 +717,6 @@ impl Engine {
             pnl_reconciliation_delta,
             state_hash: StateHash::zero(),
         })
-    }
-
-    fn ensure_currency(&self, currency_id: CurrencyId) -> Result<()> {
-        if !self.currencies.contains_key(&currency_id) {
-            return Err(Error::UnknownCurrency(currency_id));
-        }
-        Ok(())
-    }
-
-    fn ensure_account(&self, account_id: AccountId) -> Result<()> {
-        if !self.accounts.contains_key(&account_id) {
-            return Err(Error::UnknownAccount(account_id));
-        }
-        Ok(())
-    }
-
-    fn ensure_book(&self, account_id: AccountId, book_id: BookId) -> Result<()> {
-        if !self.books.contains(&(account_id, book_id)) {
-            return Err(Error::UnknownBook {
-                account_id,
-                book_id,
-            });
-        }
-        Ok(())
-    }
-
-    fn ensure_instrument(&self, instrument_id: InstrumentId) -> Result<&InstrumentMeta> {
-        self.instruments
-            .get(&instrument_id)
-            .ok_or(Error::UnknownInstrument(instrument_id))
-    }
-
-    fn ensure_money(&self, money: Money, currency_id: CurrencyId) -> Result<()> {
-        self.ensure_currency(currency_id)?;
-        if money.currency_id != currency_id || money.scale != self.config.account_money_scale {
-            return Err(Error::InvalidScale);
-        }
-        Ok(())
-    }
-
-    fn ensure_account_currency(
-        &self,
-        account_id: AccountId,
-        currency_id: CurrencyId,
-    ) -> Result<()> {
-        let account = self
-            .accounts
-            .get(&account_id)
-            .ok_or(Error::UnknownAccount(account_id))?;
-        if account.base_currency != currency_id {
-            return Err(Error::CurrencyMismatch {
-                money_currency: currency_id,
-                expected_currency: account.base_currency,
-            });
-        }
-        Ok(())
     }
 
     fn convert_money(&self, money: Money, to_currency_id: CurrencyId) -> Result<Money> {
