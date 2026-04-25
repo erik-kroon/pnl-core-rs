@@ -4,8 +4,11 @@
 //! event log, applies correction/bust override rules, and coordinates
 //! deterministic accounting rebuilds after a history rewrite.
 
-use crate::engine::{ApplyResult, Engine, Event, EventKind, Fill, PositionKey};
+use crate::engine::Engine;
 use crate::error::{Error, Result};
+use crate::event::{Event, EventKind, Fill};
+use crate::position::PositionKey;
+use crate::summary::ApplyResult;
 use crate::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -325,7 +328,7 @@ mod tests {
             seq,
             event_id,
             ts_unix_ns: seq as i64,
-            kind: EventKind::TradeCorrection(crate::engine::TradeCorrection {
+            kind: EventKind::TradeCorrection(crate::event::TradeCorrection {
                 original_event_id: EventId(10),
                 replacement,
                 reason: None,
@@ -338,7 +341,7 @@ mod tests {
             seq,
             event_id,
             ts_unix_ns: seq as i64,
-            kind: EventKind::TradeBust(crate::engine::TradeBust {
+            kind: EventKind::TradeBust(crate::event::TradeBust {
                 original_event_id: EventId(10),
                 reason: None,
             }),
