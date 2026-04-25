@@ -7,6 +7,7 @@ mod error;
 pub mod event;
 pub mod metadata;
 pub mod position;
+mod registry;
 pub(crate) mod replay_journal;
 mod snapshot;
 pub mod summary;
