@@ -1,4 +1,6 @@
+use crate::accounting::{apply_average_cost_fill, AverageCostFill};
 use crate::error::{Error, Result};
+use crate::replay_journal::{JournalAction, ReplayJournal};
 use crate::snapshot::{CanonicalStateV1, StateHash};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
@@ -193,6 +195,7 @@ pub struct ApplyResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSummary {
     pub account_id: AccountId,
+    pub base_currency: CurrencyId,
     pub cash: Money,
     pub position_market_value: Money,
     pub equity: Money,
@@ -201,9 +204,11 @@ pub struct AccountSummary {
     pub total_pnl: Money,
     pub gross_exposure: Money,
     pub net_exposure: Money,
+    pub leverage: Option<Ratio>,
     pub peak_equity: Money,
     pub current_drawdown: Money,
     pub max_drawdown: Money,
+    pub open_positions: u32,
     pub net_external_cash_flows: Money,
     pub pnl_reconciliation_delta: Money,
     pub state_hash: StateHash,
@@ -219,9 +224,7 @@ pub struct Engine {
     pub(crate) positions: BTreeMap<PositionKey, Position>,
     pub(crate) marks: BTreeMap<InstrumentId, Mark>,
     pub(crate) fx_rates: BTreeMap<(CurrencyId, CurrencyId), FxRate>,
-    pub(crate) seen_events: BTreeSet<EventId>,
-    pub(crate) event_log: Vec<Event>,
-    pub(crate) last_seq: u64,
+    pub(crate) replay_journal: ReplayJournal,
 }
 
 impl Engine {
@@ -235,9 +238,7 @@ impl Engine {
             positions: BTreeMap::new(),
             marks: BTreeMap::new(),
             fx_rates: BTreeMap::new(),
-            seen_events: BTreeSet::new(),
-            event_log: Vec::new(),
-            last_seq: 0,
+            replay_journal: ReplayJournal::new(),
         }
     }
 
@@ -301,15 +302,10 @@ impl Engine {
     }
 
     pub fn apply(&mut self, event: Event) -> Result<ApplyResult> {
-        self.validate_event_order(&event)?;
-        if self.seen_events.contains(&event.event_id) {
-            return Err(Error::DuplicateEvent(event.event_id));
-        }
-
-        if matches!(
-            event.kind,
-            EventKind::TradeCorrection(_) | EventKind::TradeBust(_)
-        ) {
+        let action = self
+            .replay_journal
+            .prepare(self.config.expected_start_seq, &event)?;
+        if action == JournalAction::RewriteHistory {
             return self.apply_history_rewrite(event);
         }
 
@@ -319,11 +315,9 @@ impl Engine {
             self.update_drawdown(account_id)?;
         }
 
-        self.last_seq = event.seq;
-        self.seen_events.insert(event.event_id);
-        self.event_log.push(event);
+        self.replay_journal.record_accepted(event);
         Ok(ApplyResult {
-            sequence: self.last_seq,
+            sequence: self.replay_journal.last_seq(),
             changed_positions,
             realized_pnl_delta: realized_delta,
             cash_delta,
@@ -342,23 +336,40 @@ impl Engine {
         let mut gross = zero;
         let mut net = zero;
         let mut unrealized = zero;
+        let mut open_positions = 0_u32;
         for position in self
             .positions
             .values()
             .filter(|p| p.key.account_id == account_id)
         {
+            if position.signed_qty.value != 0 {
+                open_positions = open_positions
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
             gross = gross.checked_add(position.gross_exposure)?;
             net = net.checked_add(position.net_exposure)?;
             unrealized = unrealized.checked_add(position.unrealized_pnl)?;
         }
         let equity = account.cash.checked_add(net)?;
         let total_pnl = account.realized_pnl.checked_add(unrealized)?;
+        let leverage = if equity.amount > 0 {
+            Some(Ratio::from_fraction(
+                gross.amount,
+                equity.amount,
+                ACCOUNT_RATIO_SCALE,
+                self.config.rounding_mode,
+            )?)
+        } else {
+            None
+        };
         let expected_pnl = equity
             .checked_sub(account.initial_cash)?
             .checked_sub(account.net_external_cash_flows)?;
         let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
         Ok(AccountSummary {
             account_id,
+            base_currency: account.base_currency,
             cash: account.cash,
             position_market_value: net,
             equity,
@@ -367,9 +378,11 @@ impl Engine {
             total_pnl,
             gross_exposure: gross,
             net_exposure: net,
+            leverage,
             peak_equity: account.peak_equity,
             current_drawdown: account.current_drawdown,
             max_drawdown: account.max_drawdown,
+            open_positions,
             net_external_cash_flows: account.net_external_cash_flows,
             pnl_reconciliation_delta,
             state_hash: self.state_hash(),
@@ -380,7 +393,7 @@ impl Engine {
         StateHash::from_canonical(&CanonicalStateV1::from_engine(self))
     }
 
-    fn apply_accounting_effect(
+    pub(super) fn apply_accounting_effect(
         &mut self,
         event: &Event,
         kind: &EventKind,
@@ -450,92 +463,41 @@ impl Engine {
     }
 
     fn apply_history_rewrite(&mut self, event: Event) -> Result<ApplyResult> {
-        let (original_event_id, replacement) = match &event.kind {
-            EventKind::TradeCorrection(correction) => {
-                (correction.original_event_id, Some(&correction.replacement))
-            }
-            EventKind::TradeBust(bust) => (bust.original_event_id, None),
-            _ => unreachable!("history rewrite only handles correction and bust events"),
-        };
-        let original = self.original_fill(original_event_id)?.clone();
-        if let Some(replacement) = replacement {
-            ensure_same_fill_key(&original, replacement)?;
-        }
-        let key = fill_key(&original);
-        let account_id = original.account_id;
+        let target = self.replay_journal.validate_rewrite_target(&event)?;
         let before_account = self
             .accounts
-            .get(&account_id)
-            .ok_or(Error::UnknownAccount(account_id))?
+            .get(&target.account_id)
+            .ok_or(Error::UnknownAccount(target.account_id))?
             .clone();
 
         let mut next = self.clone();
-        next.event_log.push(event);
-        next.rebuild_from_event_log()?;
+        next.replay_journal.record_accepted(event);
+        let mut journal = std::mem::take(&mut next.replay_journal);
+        journal.rebuild_engine(&mut next)?;
+        next.replay_journal = journal;
 
         let after_account = next
             .accounts
-            .get(&account_id)
-            .ok_or(Error::UnknownAccount(account_id))?;
+            .get(&target.account_id)
+            .ok_or(Error::UnknownAccount(target.account_id))?;
         let cash_delta = after_account.cash.checked_sub(before_account.cash)?;
         let realized_delta = after_account
             .realized_pnl
             .checked_sub(before_account.realized_pnl)?;
-        let sequence = next.last_seq;
+        let sequence = next.replay_journal.last_seq();
         let state_hash = next.state_hash();
         *self = next;
 
         Ok(ApplyResult {
             sequence,
-            changed_positions: vec![key],
+            changed_positions: vec![target.position_key],
             realized_pnl_delta: realized_delta,
             cash_delta,
             state_hash,
         })
     }
 
-    fn rebuild_from_event_log(&mut self) -> Result<()> {
-        let log = self.event_log.clone();
-        let overrides = correction_overrides(&log)?;
-        self.reset_accounting_state();
-
-        for event in &log {
-            self.validate_event_order(event)?;
-            if self.seen_events.contains(&event.event_id) {
-                return Err(Error::DuplicateEvent(event.event_id));
-            }
-            let replacement_kind;
-            let kind = match &event.kind {
-                EventKind::Fill(_) => match overrides.get(&event.event_id) {
-                    Some(Some(replacement)) => {
-                        replacement_kind = EventKind::Fill(replacement.clone());
-                        &replacement_kind
-                    }
-                    Some(None) => {
-                        self.last_seq = event.seq;
-                        self.seen_events.insert(event.event_id);
-                        continue;
-                    }
-                    None => &event.kind,
-                },
-                EventKind::TradeCorrection(_) | EventKind::TradeBust(_) => {
-                    self.last_seq = event.seq;
-                    self.seen_events.insert(event.event_id);
-                    continue;
-                }
-                _ => &event.kind,
-            };
-            let (_, _, _, drawdown_accounts) = self.apply_accounting_effect(event, kind)?;
-            for account_id in drawdown_accounts {
-                self.update_drawdown(account_id)?;
-            }
-            self.last_seq = event.seq;
-            self.seen_events.insert(event.event_id);
-        }
-        Ok(())
-    }
-
-    fn reset_accounting_state(&mut self) {
+    pub(super) fn reset_accounting_state_for_replay(&mut self) {
         for account in self.accounts.values_mut() {
             let zero = Money::zero(account.base_currency, self.config.account_money_scale);
             account.initial_cash = zero;
@@ -550,20 +512,6 @@ impl Engine {
         self.positions.clear();
         self.marks.clear();
         self.fx_rates.clear();
-        self.seen_events.clear();
-        self.last_seq = 0;
-    }
-
-    fn original_fill(&self, event_id: EventId) -> Result<&Fill> {
-        let event = self
-            .event_log
-            .iter()
-            .find(|event| event.event_id == event_id)
-            .ok_or(Error::UnknownOriginalEvent(event_id))?;
-        match &event.kind {
-            EventKind::Fill(fill) => Ok(fill),
-            _ => Err(Error::CorrectionTargetNotFill(event_id)),
-        }
     }
 
     fn apply_fill(&mut self, fill: &Fill, ts_unix_ns: i64) -> Result<(PositionKey, Money, Money)> {
@@ -591,106 +539,25 @@ impl Engine {
             instrument_id: fill.instrument_id,
         };
 
-        let signed_trade_value = value_qty_price_multiplier(
-            signed_delta,
-            qty.scale,
-            price,
-            instrument.multiplier,
-            instrument.currency_id,
-            self.config.account_money_scale,
-            self.config.rounding_mode,
-        )?;
-        let signed_trade_value = self.convert_money(signed_trade_value, account_currency)?;
-        let signed_cash_trade = signed_trade_value.checked_neg()?;
-        let cash_delta = signed_cash_trade.checked_sub(fee)?;
-
-        let zero = Money::zero(account_currency, self.config.account_money_scale);
-        let mut position = self.positions.remove(&key).unwrap_or_else(|| Position {
-            key,
-            signed_qty: Qty::zero(instrument.qty_scale),
-            avg_price: None,
-            cost_basis: zero,
-            realized_pnl: zero,
-            unrealized_pnl: zero,
-            gross_exposure: zero,
-            net_exposure: zero,
-            opened_at_unix_ns: None,
-            updated_at_unix_ns: ts_unix_ns,
-        });
-
-        let old_qty = position.signed_qty.value;
-        let new_qty = old_qty
-            .checked_add(signed_delta)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if !self.config.allow_short && new_qty < 0 {
-            return Err(Error::ShortPositionNotAllowed);
-        }
-        if !self.config.allow_position_flip
-            && old_qty != 0
-            && old_qty.signum() != new_qty.signum()
-            && new_qty != 0
-        {
-            return Err(Error::PositionFlipNotAllowed);
-        }
-
-        let mut realized_delta = fee.checked_neg()?;
-        if old_qty == 0 || old_qty.signum() == signed_delta.signum() {
-            position.avg_price = Some(if old_qty == 0 {
-                price
-            } else {
-                weighted_avg_price(
-                    old_qty.abs(),
-                    position.avg_price.unwrap(),
-                    qty.value,
-                    price,
-                    instrument.price_scale,
-                    self.config.rounding_mode,
-                )?
-            });
-            if old_qty == 0 {
-                position.opened_at_unix_ns = Some(ts_unix_ns);
-            }
-            position.cost_basis = position.cost_basis.checked_add(signed_trade_value)?;
-        } else {
-            let closed_qty = old_qty.abs().min(qty.value);
-            let old_cost_basis = position.cost_basis;
-            let closed_basis_amount = div_round(
-                old_cost_basis
-                    .amount
-                    .checked_mul(closed_qty)
-                    .ok_or(Error::ArithmeticOverflow)?,
-                old_qty.abs(),
-                self.config.rounding_mode,
-            )?;
-            let closed_basis = Money::new(
-                closed_basis_amount,
-                self.config.account_money_scale,
-                account_currency,
-            );
-            let closing_signed_qty = closed_qty
-                .checked_mul(signed_delta.signum())
-                .ok_or(Error::ArithmeticOverflow)?;
-            let closing_trade_value = value_qty_price_multiplier(
-                closing_signed_qty,
-                qty.scale,
+        let position = self.positions.remove(&key);
+        let mut outcome = apply_average_cost_fill(
+            position,
+            AverageCostFill {
+                key,
+                qty,
+                signed_delta,
                 price,
-                instrument.multiplier,
-                instrument.currency_id,
-                self.config.account_money_scale,
-                self.config.rounding_mode,
-            )?;
-            let closing_trade_value = self.convert_money(closing_trade_value, account_currency)?;
-            let closing_cash_trade = closing_trade_value.checked_neg()?;
-            let realized = closing_cash_trade.checked_sub(closed_basis)?;
-            realized_delta = realized_delta.checked_add(realized)?;
-            if new_qty == 0 {
-                position.avg_price = None;
-                position.cost_basis = zero;
-                position.opened_at_unix_ns = None;
-            } else if old_qty.signum() != new_qty.signum() {
-                position.avg_price = Some(price);
-                let new_cost_basis = value_qty_price_multiplier(
-                    new_qty,
+                fee,
+                account_money_scale: self.config.account_money_scale,
+                price_scale: instrument.price_scale,
+                rounding: self.config.rounding_mode,
+                allow_short: self.config.allow_short,
+                allow_position_flip: self.config.allow_position_flip,
+                ts_unix_ns,
+            },
+            |signed_qty| {
+                let trade_value = value_qty_price_multiplier(
+                    signed_qty,
                     qty.scale,
                     price,
                     instrument.multiplier,
@@ -698,23 +565,18 @@ impl Engine {
                     self.config.account_money_scale,
                     self.config.rounding_mode,
                 )?;
-                position.cost_basis = self.convert_money(new_cost_basis, account_currency)?;
-                position.opened_at_unix_ns = Some(ts_unix_ns);
-            } else {
-                position.cost_basis = old_cost_basis.checked_sub(closed_basis)?;
-            }
-        }
-
-        position.signed_qty = Qty::new(new_qty, instrument.qty_scale);
-        position.realized_pnl = position.realized_pnl.checked_add(realized_delta)?;
-        position.updated_at_unix_ns = ts_unix_ns;
-        self.revalue_position(&mut position, &instrument)?;
+                self.convert_money(trade_value, account_currency)
+            },
+        )?;
+        let cash_delta = outcome.cash_delta;
+        let realized_delta = outcome.realized_delta;
+        self.revalue_position(&mut outcome.position, &instrument)?;
 
         let account = self.accounts.get_mut(&fill.account_id).unwrap();
         account.cash = account.cash.checked_add(cash_delta)?;
         account.realized_pnl = account.realized_pnl.checked_add(realized_delta)?;
 
-        self.positions.insert(key, position);
+        self.positions.insert(key, outcome.position);
         Ok((key, cash_delta, realized_delta))
     }
 
@@ -840,7 +702,7 @@ impl Engine {
         Ok(())
     }
 
-    fn update_drawdown(&mut self, account_id: AccountId) -> Result<()> {
+    pub(super) fn update_drawdown(&mut self, account_id: AccountId) -> Result<()> {
         let summary = self.account_summary_without_hash(account_id)?;
         let account = self.accounts.get_mut(&account_id).unwrap();
         if !account.initial_cash_set || summary.equity.amount > account.peak_equity.amount {
@@ -860,23 +722,40 @@ impl Engine {
         let mut gross = zero;
         let mut net = zero;
         let mut unrealized = zero;
+        let mut open_positions = 0_u32;
         for position in self
             .positions
             .values()
             .filter(|p| p.key.account_id == account_id)
         {
+            if position.signed_qty.value != 0 {
+                open_positions = open_positions
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
             gross = gross.checked_add(position.gross_exposure)?;
             net = net.checked_add(position.net_exposure)?;
             unrealized = unrealized.checked_add(position.unrealized_pnl)?;
         }
         let equity = account.cash.checked_add(net)?;
         let total_pnl = account.realized_pnl.checked_add(unrealized)?;
+        let leverage = if equity.amount > 0 {
+            Some(Ratio::from_fraction(
+                gross.amount,
+                equity.amount,
+                ACCOUNT_RATIO_SCALE,
+                self.config.rounding_mode,
+            )?)
+        } else {
+            None
+        };
         let expected_pnl = equity
             .checked_sub(account.initial_cash)?
             .checked_sub(account.net_external_cash_flows)?;
         let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
         Ok(AccountSummary {
             account_id,
+            base_currency: account.base_currency,
             cash: account.cash,
             position_market_value: net,
             equity,
@@ -885,30 +764,15 @@ impl Engine {
             total_pnl,
             gross_exposure: gross,
             net_exposure: net,
+            leverage,
             peak_equity: account.peak_equity,
             current_drawdown: account.current_drawdown,
             max_drawdown: account.max_drawdown,
+            open_positions,
             net_external_cash_flows: account.net_external_cash_flows,
             pnl_reconciliation_delta,
             state_hash: StateHash::zero(),
         })
-    }
-
-    fn validate_event_order(&self, event: &Event) -> Result<()> {
-        let expected = if self.last_seq == 0 {
-            self.config.expected_start_seq
-        } else {
-            self.last_seq
-                .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow)?
-        };
-        if event.seq != expected {
-            return Err(Error::OutOfOrderEvent {
-                expected,
-                received: event.seq,
-            });
-        }
-        Ok(())
     }
 
     fn ensure_currency(&self, currency_id: CurrencyId) -> Result<()> {
@@ -1011,82 +875,4 @@ impl Engine {
             to_currency: to_currency_id,
         })
     }
-}
-
-fn correction_overrides(log: &[Event]) -> Result<BTreeMap<EventId, Option<Fill>>> {
-    let mut original_fills = BTreeMap::new();
-    let mut overrides = BTreeMap::new();
-
-    for event in log {
-        match &event.kind {
-            EventKind::Fill(fill) => {
-                original_fills.insert(event.event_id, fill.clone());
-            }
-            EventKind::TradeCorrection(correction) => {
-                let original = original_fills
-                    .get(&correction.original_event_id)
-                    .ok_or(Error::UnknownOriginalEvent(correction.original_event_id))?;
-                ensure_same_fill_key(original, &correction.replacement)?;
-                overrides.insert(
-                    correction.original_event_id,
-                    Some(correction.replacement.clone()),
-                );
-            }
-            EventKind::TradeBust(bust) => {
-                if !original_fills.contains_key(&bust.original_event_id) {
-                    return Err(Error::UnknownOriginalEvent(bust.original_event_id));
-                }
-                overrides.insert(bust.original_event_id, None);
-            }
-            _ => {}
-        }
-    }
-
-    Ok(overrides)
-}
-
-fn ensure_same_fill_key(original: &Fill, replacement: &Fill) -> Result<()> {
-    if original.account_id != replacement.account_id
-        || original.book_id != replacement.book_id
-        || original.instrument_id != replacement.instrument_id
-    {
-        return Err(Error::CorrectionKeyMismatch);
-    }
-    Ok(())
-}
-
-fn fill_key(fill: &Fill) -> PositionKey {
-    PositionKey {
-        account_id: fill.account_id,
-        book_id: fill.book_id,
-        instrument_id: fill.instrument_id,
-    }
-}
-
-fn weighted_avg_price(
-    old_abs_qty: i128,
-    old_avg: Price,
-    add_abs_qty: i128,
-    add_price: Price,
-    price_scale: u8,
-    rounding: RoundingMode,
-) -> Result<Price> {
-    let old_price = old_avg.to_scale(price_scale, rounding)?;
-    let new_price = add_price.to_scale(price_scale, rounding)?;
-    let old_cost = old_abs_qty
-        .checked_mul(old_price.value)
-        .ok_or(Error::ArithmeticOverflow)?;
-    let add_cost = add_abs_qty
-        .checked_mul(new_price.value)
-        .ok_or(Error::ArithmeticOverflow)?;
-    let total_cost = old_cost
-        .checked_add(add_cost)
-        .ok_or(Error::ArithmeticOverflow)?;
-    let total_qty = old_abs_qty
-        .checked_add(add_abs_qty)
-        .ok_or(Error::ArithmeticOverflow)?;
-    Ok(Price::new(
-        div_round(total_cost, total_qty, rounding)?,
-        price_scale,
-    ))
 }

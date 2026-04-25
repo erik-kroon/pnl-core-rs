@@ -1,5 +1,6 @@
 use crate::engine::*;
 use crate::error::{Error, Result};
+use crate::replay_journal::ReplayJournal;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -74,9 +75,14 @@ impl CanonicalStateV1 {
             positions: engine.positions.values().cloned().collect(),
             marks: engine.marks.values().cloned().collect(),
             fx_rates: engine.fx_rates.values().cloned().collect(),
-            seen_events: engine.seen_events.iter().copied().collect(),
-            event_log: engine.event_log.clone(),
-            last_seq: engine.last_seq,
+            seen_events: engine
+                .replay_journal
+                .seen_events()
+                .iter()
+                .copied()
+                .collect(),
+            event_log: engine.replay_journal.events().to_vec(),
+            last_seq: engine.replay_journal.last_seq(),
         }
     }
 
@@ -114,9 +120,11 @@ impl CanonicalStateV1 {
                 .into_iter()
                 .map(|rate| ((rate.from_currency_id, rate.to_currency_id), rate))
                 .collect(),
-            seen_events: self.seen_events.into_iter().collect(),
-            event_log: self.event_log,
-            last_seq: self.last_seq,
+            replay_journal: ReplayJournal::from_parts(
+                self.seen_events.into_iter().collect(),
+                self.event_log,
+                self.last_seq,
+            ),
         }
     }
 }
@@ -127,8 +135,8 @@ impl Engine {
         let state_hash = StateHash::from_canonical(&state);
         Ok(SnapshotV1 {
             metadata: SnapshotMetadataV1 {
-                snapshot_sequence: self.last_seq,
-                last_applied_event_seq: self.last_seq,
+                snapshot_sequence: self.replay_journal.last_seq(),
+                last_applied_event_seq: self.replay_journal.last_seq(),
                 state_hash,
             },
             state,
@@ -266,6 +274,8 @@ impl Engine {
                 }
             }
         }
+        self.replay_journal
+            .validate_restored(self.config.expected_start_seq)?;
         Ok(())
     }
 }
