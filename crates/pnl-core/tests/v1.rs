@@ -180,6 +180,31 @@ fn mark(seq: u64, px: &str) -> Event {
     }
 }
 
+fn correct_fill(seq: u64, original_event_id: EventId, replacement: Fill) -> Event {
+    Event {
+        seq,
+        event_id: EventId(seq),
+        ts_unix_ns: seq as i64,
+        kind: EventKind::TradeCorrection(TradeCorrection {
+            original_event_id,
+            replacement,
+            reason: Some("test correction".to_string()),
+        }),
+    }
+}
+
+fn bust_fill(seq: u64, original_event_id: EventId) -> Event {
+    Event {
+        seq,
+        event_id: EventId(seq),
+        ts_unix_ns: seq as i64,
+        kind: EventKind::TradeBust(TradeBust {
+            original_event_id,
+            reason: Some("test bust".to_string()),
+        }),
+    }
+}
+
 #[test]
 fn open_long_and_mark_reconciles_cash_equity_and_pnl() {
     let mut engine = setup();
@@ -228,6 +253,92 @@ fn cross_currency_fill_mark_and_fx_revalue_in_account_currency() {
     assert_eq!(summary.realized_pnl, money("-2.20"));
     assert_eq!(summary.unrealized_pnl, money("220.00"));
     assert_eq!(summary.total_pnl, money("217.80"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn trade_correction_replays_replacement_fill_before_later_events() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    engine.apply(fill(3, Side::Sell, 40, "12.00", "0")).unwrap();
+
+    let replacement = Fill {
+        account_id: AccountId(1),
+        book_id: BookId(1),
+        instrument_id: InstrumentId(1),
+        side: Side::Buy,
+        qty: Qty::from_units(100),
+        price: price("9.00"),
+        fee: money("0"),
+    };
+    engine
+        .apply(correct_fill(4, EventId(2), replacement))
+        .unwrap();
+
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    let pos = engine
+        .position(PositionKey {
+            account_id: AccountId(1),
+            book_id: BookId(1),
+            instrument_id: InstrumentId(1),
+        })
+        .unwrap();
+    assert_eq!(pos.signed_qty, Qty::from_units(60));
+    assert_eq!(pos.cost_basis, money("540.00"));
+    assert_eq!(summary.realized_pnl, money("120.00"));
+    assert_eq!(summary.cash, money("9580.00"));
+    assert_eq!(summary.equity, money("10120.00"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn trade_bust_replays_without_original_fill() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    engine.apply(mark(3, "12.00")).unwrap();
+    engine.apply(bust_fill(4, EventId(2))).unwrap();
+
+    let summary = engine.account_summary(AccountId(1)).unwrap();
+    assert!(engine
+        .position(PositionKey {
+            account_id: AccountId(1),
+            book_id: BookId(1),
+            instrument_id: InstrumentId(1),
+        })
+        .is_none());
+    assert_eq!(summary.cash, money("10000.00"));
+    assert_eq!(summary.realized_pnl, money("0.00"));
+    assert_eq!(summary.unrealized_pnl, money("0.00"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn restored_snapshot_can_correct_prior_fill() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+
+    let mut bytes = Vec::new();
+    engine.write_snapshot(&mut bytes).unwrap();
+    let mut restored = Engine::read_snapshot(bytes.as_slice()).unwrap();
+    let replacement = Fill {
+        account_id: AccountId(1),
+        book_id: BookId(1),
+        instrument_id: InstrumentId(1),
+        side: Side::Buy,
+        qty: Qty::from_units(100),
+        price: price("9.00"),
+        fee: money("0"),
+    };
+    restored
+        .apply(correct_fill(3, EventId(2), replacement))
+        .unwrap();
+
+    let summary = restored.account_summary(AccountId(1)).unwrap();
+    assert_eq!(summary.cash, money("9100.00"));
+    assert_eq!(summary.equity, money("10000.00"));
     assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
 }
 

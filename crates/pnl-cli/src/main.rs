@@ -95,6 +95,7 @@ struct RawEvent {
     ts_unix_ns: i64,
     #[serde(rename = "type")]
     event_type: String,
+    original_event_id: Option<u64>,
     account_id: Option<u64>,
     book_id: Option<u64>,
     instrument_id: Option<u64>,
@@ -329,26 +330,16 @@ fn raw_event_to_core(raw: RawEvent, base_currency: CurrencyId, money_scale: u8) 
                 reason: raw.reason,
             })
         }
-        "fill" => {
-            let side = match required(raw.side.as_deref(), "side")? {
-                "buy" => Side::Buy,
-                "sell" => Side::Sell,
-                other => anyhow::bail!("unsupported side {other}"),
-            };
-            EventKind::Fill(Fill {
-                account_id: AccountId(required(raw.account_id, "account_id")?),
-                book_id: BookId(required(raw.book_id, "book_id")?),
-                instrument_id: InstrumentId(required(raw.instrument_id, "instrument_id")?),
-                side,
-                qty: Qty::parse_decimal(required(raw.qty.as_deref(), "qty")?)?,
-                price: Price::parse_decimal(required(raw.price.as_deref(), "price")?)?,
-                fee: Money::parse_decimal(
-                    raw.fee.as_deref().unwrap_or("0"),
-                    currency(raw.fee_currency.as_deref(), base_currency)?,
-                    money_scale,
-                )?,
-            })
-        }
+        "fill" => EventKind::Fill(raw_fill(&raw, base_currency, money_scale)?),
+        "trade_correction" => EventKind::TradeCorrection(TradeCorrection {
+            original_event_id: EventId(required(raw.original_event_id, "original_event_id")?),
+            replacement: raw_fill(&raw, base_currency, money_scale)?,
+            reason: raw.reason,
+        }),
+        "trade_bust" => EventKind::TradeBust(TradeBust {
+            original_event_id: EventId(required(raw.original_event_id, "original_event_id")?),
+            reason: raw.reason,
+        }),
         "mark" => EventKind::Mark(MarkPriceUpdate {
             instrument_id: InstrumentId(required(raw.instrument_id, "instrument_id")?),
             price: Price::parse_decimal(required(raw.price.as_deref(), "price")?)?,
@@ -371,6 +362,27 @@ fn raw_event_to_core(raw: RawEvent, base_currency: CurrencyId, money_scale: u8) 
         event_id,
         ts_unix_ns: raw.ts_unix_ns,
         kind,
+    })
+}
+
+fn raw_fill(raw: &RawEvent, base_currency: CurrencyId, money_scale: u8) -> Result<Fill> {
+    let side = match required(raw.side.as_deref(), "side")? {
+        "buy" => Side::Buy,
+        "sell" => Side::Sell,
+        other => anyhow::bail!("unsupported side {other}"),
+    };
+    Ok(Fill {
+        account_id: AccountId(required(raw.account_id, "account_id")?),
+        book_id: BookId(required(raw.book_id, "book_id")?),
+        instrument_id: InstrumentId(required(raw.instrument_id, "instrument_id")?),
+        side,
+        qty: Qty::parse_decimal(required(raw.qty.as_deref(), "qty")?)?,
+        price: Price::parse_decimal(required(raw.price.as_deref(), "price")?)?,
+        fee: Money::parse_decimal(
+            raw.fee.as_deref().unwrap_or("0"),
+            currency(raw.fee_currency.as_deref(), base_currency)?,
+            money_scale,
+        )?,
     })
 }
 

@@ -125,6 +125,8 @@ pub enum EventKind {
     Fill(Fill),
     Mark(MarkPriceUpdate),
     FxRate(FxRateUpdate),
+    TradeCorrection(TradeCorrection),
+    TradeBust(TradeBust),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +153,19 @@ pub struct Fill {
     pub qty: Qty,
     pub price: Price,
     pub fee: Money,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeCorrection {
+    pub original_event_id: EventId,
+    pub replacement: Fill,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeBust {
+    pub original_event_id: EventId,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +220,7 @@ pub struct Engine {
     pub(crate) marks: BTreeMap<InstrumentId, Mark>,
     pub(crate) fx_rates: BTreeMap<(CurrencyId, CurrencyId), FxRate>,
     pub(crate) seen_events: BTreeSet<EventId>,
+    pub(crate) event_log: Vec<Event>,
     pub(crate) last_seq: u64,
 }
 
@@ -220,6 +236,7 @@ impl Engine {
             marks: BTreeMap::new(),
             fx_rates: BTreeMap::new(),
             seen_events: BTreeSet::new(),
+            event_log: Vec::new(),
             last_seq: 0,
         }
     }
@@ -289,67 +306,22 @@ impl Engine {
             return Err(Error::DuplicateEvent(event.event_id));
         }
 
-        let zero = Money::zero(self.config.base_currency, self.config.account_money_scale);
-        let mut changed_positions = Vec::new();
-        let mut cash_delta = zero;
-        let mut realized_delta = zero;
-        let mut drawdown_accounts = BTreeSet::new();
-
-        match &event.kind {
-            EventKind::InitialCash(initial) => {
-                self.ensure_account(initial.account_id)?;
-                self.ensure_money(initial.amount, initial.currency_id)?;
-                self.ensure_account_currency(initial.account_id, initial.currency_id)?;
-                let account = self.accounts.get_mut(&initial.account_id).unwrap();
-                let delta = initial.amount.checked_sub(account.cash)?;
-                account.initial_cash = initial.amount;
-                account.cash = initial.amount;
-                account.initial_cash_set = true;
-                cash_delta = delta;
-                drawdown_accounts.insert(initial.account_id);
-            }
-            EventKind::CashAdjustment(adj) => {
-                self.ensure_account(adj.account_id)?;
-                self.ensure_money(adj.amount, adj.currency_id)?;
-                self.ensure_account_currency(adj.account_id, adj.currency_id)?;
-                let account = self.accounts.get_mut(&adj.account_id).unwrap();
-                account.cash = account.cash.checked_add(adj.amount)?;
-                account.net_external_cash_flows =
-                    account.net_external_cash_flows.checked_add(adj.amount)?;
-                cash_delta = adj.amount;
-                drawdown_accounts.insert(adj.account_id);
-            }
-            EventKind::Fill(fill) => {
-                let (changed, c_delta, r_delta) = self.apply_fill(fill, event.ts_unix_ns)?;
-                changed_positions.push(changed);
-                cash_delta = c_delta;
-                realized_delta = r_delta;
-                drawdown_accounts.insert(fill.account_id);
-            }
-            EventKind::Mark(mark) => {
-                self.apply_mark(
-                    mark,
-                    event.ts_unix_ns,
-                    &mut changed_positions,
-                    &mut drawdown_accounts,
-                )?;
-            }
-            EventKind::FxRate(fx) => {
-                self.apply_fx_rate(
-                    fx,
-                    event.ts_unix_ns,
-                    &mut changed_positions,
-                    &mut drawdown_accounts,
-                )?;
-            }
+        if matches!(
+            event.kind,
+            EventKind::TradeCorrection(_) | EventKind::TradeBust(_)
+        ) {
+            return self.apply_history_rewrite(event);
         }
 
+        let (changed_positions, cash_delta, realized_delta, drawdown_accounts) =
+            self.apply_accounting_effect(&event, &event.kind)?;
         for account_id in drawdown_accounts {
             self.update_drawdown(account_id)?;
         }
 
         self.last_seq = event.seq;
         self.seen_events.insert(event.event_id);
+        self.event_log.push(event);
         Ok(ApplyResult {
             sequence: self.last_seq,
             changed_positions,
@@ -406,6 +378,192 @@ impl Engine {
 
     pub fn state_hash(&self) -> StateHash {
         StateHash::from_canonical(&CanonicalStateV1::from_engine(self))
+    }
+
+    fn apply_accounting_effect(
+        &mut self,
+        event: &Event,
+        kind: &EventKind,
+    ) -> Result<(Vec<PositionKey>, Money, Money, BTreeSet<AccountId>)> {
+        let zero = Money::zero(self.config.base_currency, self.config.account_money_scale);
+        let mut changed_positions = Vec::new();
+        let mut cash_delta = zero;
+        let mut realized_delta = zero;
+        let mut drawdown_accounts = BTreeSet::new();
+
+        match kind {
+            EventKind::InitialCash(initial) => {
+                self.ensure_account(initial.account_id)?;
+                self.ensure_money(initial.amount, initial.currency_id)?;
+                self.ensure_account_currency(initial.account_id, initial.currency_id)?;
+                let account = self.accounts.get_mut(&initial.account_id).unwrap();
+                let delta = initial.amount.checked_sub(account.cash)?;
+                account.initial_cash = initial.amount;
+                account.cash = initial.amount;
+                account.initial_cash_set = true;
+                cash_delta = delta;
+                drawdown_accounts.insert(initial.account_id);
+            }
+            EventKind::CashAdjustment(adj) => {
+                self.ensure_account(adj.account_id)?;
+                self.ensure_money(adj.amount, adj.currency_id)?;
+                self.ensure_account_currency(adj.account_id, adj.currency_id)?;
+                let account = self.accounts.get_mut(&adj.account_id).unwrap();
+                account.cash = account.cash.checked_add(adj.amount)?;
+                account.net_external_cash_flows =
+                    account.net_external_cash_flows.checked_add(adj.amount)?;
+                cash_delta = adj.amount;
+                drawdown_accounts.insert(adj.account_id);
+            }
+            EventKind::Fill(fill) => {
+                let (changed, c_delta, r_delta) = self.apply_fill(fill, event.ts_unix_ns)?;
+                changed_positions.push(changed);
+                cash_delta = c_delta;
+                realized_delta = r_delta;
+                drawdown_accounts.insert(fill.account_id);
+            }
+            EventKind::Mark(mark) => {
+                self.apply_mark(
+                    mark,
+                    event.ts_unix_ns,
+                    &mut changed_positions,
+                    &mut drawdown_accounts,
+                )?;
+            }
+            EventKind::FxRate(fx) => {
+                self.apply_fx_rate(
+                    fx,
+                    event.ts_unix_ns,
+                    &mut changed_positions,
+                    &mut drawdown_accounts,
+                )?;
+            }
+            EventKind::TradeCorrection(_) | EventKind::TradeBust(_) => {}
+        }
+
+        Ok((
+            changed_positions,
+            cash_delta,
+            realized_delta,
+            drawdown_accounts,
+        ))
+    }
+
+    fn apply_history_rewrite(&mut self, event: Event) -> Result<ApplyResult> {
+        let (original_event_id, replacement) = match &event.kind {
+            EventKind::TradeCorrection(correction) => {
+                (correction.original_event_id, Some(&correction.replacement))
+            }
+            EventKind::TradeBust(bust) => (bust.original_event_id, None),
+            _ => unreachable!("history rewrite only handles correction and bust events"),
+        };
+        let original = self.original_fill(original_event_id)?.clone();
+        if let Some(replacement) = replacement {
+            ensure_same_fill_key(&original, replacement)?;
+        }
+        let key = fill_key(&original);
+        let account_id = original.account_id;
+        let before_account = self
+            .accounts
+            .get(&account_id)
+            .ok_or(Error::UnknownAccount(account_id))?
+            .clone();
+
+        let mut next = self.clone();
+        next.event_log.push(event);
+        next.rebuild_from_event_log()?;
+
+        let after_account = next
+            .accounts
+            .get(&account_id)
+            .ok_or(Error::UnknownAccount(account_id))?;
+        let cash_delta = after_account.cash.checked_sub(before_account.cash)?;
+        let realized_delta = after_account
+            .realized_pnl
+            .checked_sub(before_account.realized_pnl)?;
+        let sequence = next.last_seq;
+        let state_hash = next.state_hash();
+        *self = next;
+
+        Ok(ApplyResult {
+            sequence,
+            changed_positions: vec![key],
+            realized_pnl_delta: realized_delta,
+            cash_delta,
+            state_hash,
+        })
+    }
+
+    fn rebuild_from_event_log(&mut self) -> Result<()> {
+        let log = self.event_log.clone();
+        let overrides = correction_overrides(&log)?;
+        self.reset_accounting_state();
+
+        for event in &log {
+            self.validate_event_order(event)?;
+            if self.seen_events.contains(&event.event_id) {
+                return Err(Error::DuplicateEvent(event.event_id));
+            }
+            let replacement_kind;
+            let kind = match &event.kind {
+                EventKind::Fill(_) => match overrides.get(&event.event_id) {
+                    Some(Some(replacement)) => {
+                        replacement_kind = EventKind::Fill(replacement.clone());
+                        &replacement_kind
+                    }
+                    Some(None) => {
+                        self.last_seq = event.seq;
+                        self.seen_events.insert(event.event_id);
+                        continue;
+                    }
+                    None => &event.kind,
+                },
+                EventKind::TradeCorrection(_) | EventKind::TradeBust(_) => {
+                    self.last_seq = event.seq;
+                    self.seen_events.insert(event.event_id);
+                    continue;
+                }
+                _ => &event.kind,
+            };
+            let (_, _, _, drawdown_accounts) = self.apply_accounting_effect(event, kind)?;
+            for account_id in drawdown_accounts {
+                self.update_drawdown(account_id)?;
+            }
+            self.last_seq = event.seq;
+            self.seen_events.insert(event.event_id);
+        }
+        Ok(())
+    }
+
+    fn reset_accounting_state(&mut self) {
+        for account in self.accounts.values_mut() {
+            let zero = Money::zero(account.base_currency, self.config.account_money_scale);
+            account.initial_cash = zero;
+            account.cash = zero;
+            account.net_external_cash_flows = zero;
+            account.realized_pnl = zero;
+            account.peak_equity = zero;
+            account.current_drawdown = zero;
+            account.max_drawdown = zero;
+            account.initial_cash_set = false;
+        }
+        self.positions.clear();
+        self.marks.clear();
+        self.fx_rates.clear();
+        self.seen_events.clear();
+        self.last_seq = 0;
+    }
+
+    fn original_fill(&self, event_id: EventId) -> Result<&Fill> {
+        let event = self
+            .event_log
+            .iter()
+            .find(|event| event.event_id == event_id)
+            .ok_or(Error::UnknownOriginalEvent(event_id))?;
+        match &event.kind {
+            EventKind::Fill(fill) => Ok(fill),
+            _ => Err(Error::CorrectionTargetNotFill(event_id)),
+        }
     }
 
     fn apply_fill(&mut self, fill: &Fill, ts_unix_ns: i64) -> Result<(PositionKey, Money, Money)> {
@@ -852,6 +1010,56 @@ impl Engine {
             from_currency: from_currency_id,
             to_currency: to_currency_id,
         })
+    }
+}
+
+fn correction_overrides(log: &[Event]) -> Result<BTreeMap<EventId, Option<Fill>>> {
+    let mut original_fills = BTreeMap::new();
+    let mut overrides = BTreeMap::new();
+
+    for event in log {
+        match &event.kind {
+            EventKind::Fill(fill) => {
+                original_fills.insert(event.event_id, fill.clone());
+            }
+            EventKind::TradeCorrection(correction) => {
+                let original = original_fills
+                    .get(&correction.original_event_id)
+                    .ok_or(Error::UnknownOriginalEvent(correction.original_event_id))?;
+                ensure_same_fill_key(original, &correction.replacement)?;
+                overrides.insert(
+                    correction.original_event_id,
+                    Some(correction.replacement.clone()),
+                );
+            }
+            EventKind::TradeBust(bust) => {
+                if !original_fills.contains_key(&bust.original_event_id) {
+                    return Err(Error::UnknownOriginalEvent(bust.original_event_id));
+                }
+                overrides.insert(bust.original_event_id, None);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(overrides)
+}
+
+fn ensure_same_fill_key(original: &Fill, replacement: &Fill) -> Result<()> {
+    if original.account_id != replacement.account_id
+        || original.book_id != replacement.book_id
+        || original.instrument_id != replacement.instrument_id
+    {
+        return Err(Error::CorrectionKeyMismatch);
+    }
+    Ok(())
+}
+
+fn fill_key(fill: &Fill) -> PositionKey {
+    PositionKey {
+        account_id: fill.account_id,
+        book_id: fill.book_id,
+        instrument_id: fill.instrument_id,
     }
 }
 

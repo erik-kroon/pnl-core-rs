@@ -52,6 +52,7 @@ pub struct CanonicalStateV1 {
     pub marks: Vec<Mark>,
     pub fx_rates: Vec<FxRate>,
     pub seen_events: Vec<EventId>,
+    pub event_log: Vec<Event>,
     pub last_seq: u64,
 }
 
@@ -74,6 +75,7 @@ impl CanonicalStateV1 {
             marks: engine.marks.values().cloned().collect(),
             fx_rates: engine.fx_rates.values().cloned().collect(),
             seen_events: engine.seen_events.iter().copied().collect(),
+            event_log: engine.event_log.clone(),
             last_seq: engine.last_seq,
         }
     }
@@ -113,6 +115,7 @@ impl CanonicalStateV1 {
                 .map(|rate| ((rate.from_currency_id, rate.to_currency_id), rate))
                 .collect(),
             seen_events: self.seen_events.into_iter().collect(),
+            event_log: self.event_log,
             last_seq: self.last_seq,
         }
     }
