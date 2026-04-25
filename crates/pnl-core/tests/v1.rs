@@ -243,6 +243,30 @@ fn drawdown_updates_after_marks_and_recovers_peak() {
 }
 
 #[test]
+fn reconciliation_invariant_holds_after_every_successful_event() {
+    let mut engine = setup();
+    for event in [
+        initial(1, "10000.00"),
+        fill(2, Side::Buy, 100, "10.00", "1.00"),
+        mark(3, "12.00"),
+        fill(4, Side::Sell, 40, "12.00", "1.00"),
+        cash(5, "250.00"),
+        fill(6, Side::Sell, 100, "11.00", "0.50"),
+        mark(7, "9.00"),
+        fill(8, Side::Buy, 10, "8.00", "-0.25"),
+    ] {
+        let seq = event.seq;
+        engine.apply(event).unwrap();
+        let summary = engine.account_summary(AccountId(1)).unwrap();
+        assert_eq!(
+            summary.pnl_reconciliation_delta,
+            money("0.00"),
+            "reconciliation failed after sequence {seq}"
+        );
+    }
+}
+
+#[test]
 fn replay_is_strict_and_duplicate_event_ids_fail() {
     let mut engine = setup();
     engine.apply(initial(1, "1000.00")).unwrap();

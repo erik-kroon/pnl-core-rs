@@ -20,6 +20,28 @@ V1 is intentionally narrow:
 
 Not included in v1: FX, FIFO/LIFO, trade corrections/busts, Python/C/WASM bindings, Arrow/Parquet export, broker connectors, order management, or strategy logic.
 
+## Core Invariants
+
+- Cash is authoritative.
+- Equity is always derived as `cash + position_market_value`.
+- Replay is strict and contiguous by sequence number.
+- Duplicate event IDs are rejected.
+- Average-cost accounting is the only v1 accounting method.
+- State hash is deterministic over canonical accounting state.
+- Snapshots encode canonical state, not raw engine internals.
+
+## Known Limitations
+
+- Single account currency only.
+- Average-cost accounting only.
+- Fees are assumed to be in account currency.
+- No FX conversion.
+- No FIFO/LIFO lots.
+- No corrections/busts.
+- No settlement model.
+- No dividends, funding payments, or borrow fees.
+- State hash is a deterministic fingerprint, not a cryptographic audit proof.
+
 ## Workspace
 
 ```text
@@ -95,7 +117,12 @@ println!("{summary:?}");
 
 - Cash is source of truth.
 - Equity is derived as `cash + position_market_value`.
-- Fees reduce cash and realized PnL immediately.
+- Positive fee means cost.
+- Negative fee means rebate.
+- Fees are assumed to be in account currency.
+- Fees reduce cash immediately.
+- Fees are recognized immediately in realized PnL.
+- Fees are not capitalized into average price.
 - Position cost basis is tracked separately from rounded average price so summaries reconcile under fixed-point rounding.
 - If no mark is available, position market value uses signed cost basis and unrealized PnL is zero.
 - Once a mark is available, unrealized PnL is `marked_market_value - signed_cost_basis`.
@@ -147,4 +174,3 @@ Benchmark output is hardware-dependent. Current benchmark targets cover `apply_f
 - WASM package.
 - Arrow/Parquet export.
 - Explain APIs and reconciliation reports.
-
