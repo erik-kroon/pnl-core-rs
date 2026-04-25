@@ -1,3 +1,4 @@
+use crate::account_metrics::AccountMetrics;
 use crate::accounting::{apply_average_cost_fill, AverageCostFill};
 use crate::error::{Error, Result};
 use crate::replay_journal::{JournalAction, ReplayJournal};
@@ -330,63 +331,7 @@ impl Engine {
     }
 
     pub fn account_summary(&self, account_id: AccountId) -> Result<AccountSummary> {
-        self.ensure_account(account_id)?;
-        let account = self.accounts.get(&account_id).unwrap();
-        let zero = Money::zero(account.base_currency, self.config.account_money_scale);
-        let mut gross = zero;
-        let mut net = zero;
-        let mut unrealized = zero;
-        let mut open_positions = 0_u32;
-        for position in self
-            .positions
-            .values()
-            .filter(|p| p.key.account_id == account_id)
-        {
-            if position.signed_qty.value != 0 {
-                open_positions = open_positions
-                    .checked_add(1)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            }
-            gross = gross.checked_add(position.gross_exposure)?;
-            net = net.checked_add(position.net_exposure)?;
-            unrealized = unrealized.checked_add(position.unrealized_pnl)?;
-        }
-        let equity = account.cash.checked_add(net)?;
-        let total_pnl = account.realized_pnl.checked_add(unrealized)?;
-        let leverage = if equity.amount > 0 {
-            Some(Ratio::from_fraction(
-                gross.amount,
-                equity.amount,
-                ACCOUNT_RATIO_SCALE,
-                self.config.rounding_mode,
-            )?)
-        } else {
-            None
-        };
-        let expected_pnl = equity
-            .checked_sub(account.initial_cash)?
-            .checked_sub(account.net_external_cash_flows)?;
-        let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
-        Ok(AccountSummary {
-            account_id,
-            base_currency: account.base_currency,
-            cash: account.cash,
-            position_market_value: net,
-            equity,
-            realized_pnl: account.realized_pnl,
-            unrealized_pnl: unrealized,
-            total_pnl,
-            gross_exposure: gross,
-            net_exposure: net,
-            leverage,
-            peak_equity: account.peak_equity,
-            current_drawdown: account.current_drawdown,
-            max_drawdown: account.max_drawdown,
-            open_positions,
-            net_external_cash_flows: account.net_external_cash_flows,
-            pnl_reconciliation_delta,
-            state_hash: self.state_hash(),
-        })
+        Ok(AccountMetrics::compute(self, account_id)?.into_summary(self.state_hash()))
     }
 
     pub fn state_hash(&self) -> StateHash {
@@ -703,76 +648,16 @@ impl Engine {
     }
 
     pub(super) fn update_drawdown(&mut self, account_id: AccountId) -> Result<()> {
-        let summary = self.account_summary_without_hash(account_id)?;
+        let equity = AccountMetrics::compute(self, account_id)?.equity();
         let account = self.accounts.get_mut(&account_id).unwrap();
-        if !account.initial_cash_set || summary.equity.amount > account.peak_equity.amount {
-            account.peak_equity = summary.equity;
+        if !account.initial_cash_set || equity.amount > account.peak_equity.amount {
+            account.peak_equity = equity;
         }
-        account.current_drawdown = summary.equity.checked_sub(account.peak_equity)?;
+        account.current_drawdown = equity.checked_sub(account.peak_equity)?;
         if account.current_drawdown.amount < account.max_drawdown.amount {
             account.max_drawdown = account.current_drawdown;
         }
         Ok(())
-    }
-
-    fn account_summary_without_hash(&self, account_id: AccountId) -> Result<AccountSummary> {
-        self.ensure_account(account_id)?;
-        let account = self.accounts.get(&account_id).unwrap();
-        let zero = Money::zero(account.base_currency, self.config.account_money_scale);
-        let mut gross = zero;
-        let mut net = zero;
-        let mut unrealized = zero;
-        let mut open_positions = 0_u32;
-        for position in self
-            .positions
-            .values()
-            .filter(|p| p.key.account_id == account_id)
-        {
-            if position.signed_qty.value != 0 {
-                open_positions = open_positions
-                    .checked_add(1)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            }
-            gross = gross.checked_add(position.gross_exposure)?;
-            net = net.checked_add(position.net_exposure)?;
-            unrealized = unrealized.checked_add(position.unrealized_pnl)?;
-        }
-        let equity = account.cash.checked_add(net)?;
-        let total_pnl = account.realized_pnl.checked_add(unrealized)?;
-        let leverage = if equity.amount > 0 {
-            Some(Ratio::from_fraction(
-                gross.amount,
-                equity.amount,
-                ACCOUNT_RATIO_SCALE,
-                self.config.rounding_mode,
-            )?)
-        } else {
-            None
-        };
-        let expected_pnl = equity
-            .checked_sub(account.initial_cash)?
-            .checked_sub(account.net_external_cash_flows)?;
-        let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
-        Ok(AccountSummary {
-            account_id,
-            base_currency: account.base_currency,
-            cash: account.cash,
-            position_market_value: net,
-            equity,
-            realized_pnl: account.realized_pnl,
-            unrealized_pnl: unrealized,
-            total_pnl,
-            gross_exposure: gross,
-            net_exposure: net,
-            leverage,
-            peak_equity: account.peak_equity,
-            current_drawdown: account.current_drawdown,
-            max_drawdown: account.max_drawdown,
-            open_positions,
-            net_external_cash_flows: account.net_external_cash_flows,
-            pnl_reconciliation_delta,
-            state_hash: StateHash::zero(),
-        })
     }
 
     fn ensure_currency(&self, currency_id: CurrencyId) -> Result<()> {
