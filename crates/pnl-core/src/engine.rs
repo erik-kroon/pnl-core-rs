@@ -1,13 +1,14 @@
 use crate::account::AccountState;
 use crate::account_metrics::AccountMetrics;
 use crate::accounting::{
-    apply_average_cost_fill, fill_position_key, AverageCostConfig, AverageCostFillInput,
+    apply_average_cost_fill, apply_lot_fill, fill_position_key, AverageCostConfig,
+    AverageCostFillInput, LotAccountingConfig, LotFillInput,
 };
 use crate::config::EngineConfig;
 use crate::error::Result;
 use crate::event::{Event, EventKind, Fill, FxRateUpdate, MarkPriceUpdate};
 use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
-use crate::position::{FxRate, Mark, Position, PositionKey};
+use crate::position::{FxRate, Lot, LotId, Mark, Position, PositionKey};
 use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
 use crate::state_hash::{hash_engine_state, StateHash};
@@ -96,6 +97,7 @@ pub struct Engine {
     pub(crate) registry: Registry,
     pub(crate) accounts: BTreeMap<AccountId, AccountState>,
     pub(crate) positions: BTreeMap<PositionKey, Position>,
+    pub(crate) lots: BTreeMap<(PositionKey, LotId), Lot>,
     pub(crate) marks: BTreeMap<InstrumentId, Mark>,
     pub(crate) fx_rates: BTreeMap<(CurrencyId, CurrencyId), FxRate>,
     pub(crate) replay_journal: ReplayJournal,
@@ -108,6 +110,7 @@ impl Engine {
             registry: Registry::new(),
             accounts: BTreeMap::new(),
             positions: BTreeMap::new(),
+            lots: BTreeMap::new(),
             marks: BTreeMap::new(),
             fx_rates: BTreeMap::new(),
             replay_journal: ReplayJournal::new(),
@@ -120,6 +123,31 @@ impl Engine {
 
     pub fn positions(&self) -> impl Iterator<Item = &Position> {
         self.positions.values()
+    }
+
+    pub fn lots(&self) -> impl Iterator<Item = &Lot> {
+        self.lots.values()
+    }
+
+    pub fn lots_for_position(&self, key: PositionKey) -> impl Iterator<Item = &Lot> {
+        self.lots
+            .range(
+                (
+                    key,
+                    LotId {
+                        source_event_id: EventId(0),
+                        leg_index: 0,
+                    },
+                )
+                    ..=(
+                        key,
+                        LotId {
+                            source_event_id: EventId(u64::MAX),
+                            leg_index: u8::MAX,
+                        },
+                    ),
+            )
+            .map(|(_, lot)| lot)
     }
 
     pub fn register_currency(&mut self, meta: CurrencyMeta) -> Result<()> {
@@ -232,7 +260,7 @@ impl Engine {
                 effect.require_drawdown_update(adj.account_id);
             }
             EventKind::Fill(fill) => {
-                let (changed, c_delta, r_delta) = self.apply_fill(fill, event.ts_unix_ns)?;
+                let (changed, c_delta, r_delta) = self.apply_fill(event, fill)?;
                 effect.record_changed_position(changed);
                 effect.record_cash_delta(c_delta);
                 effect.record_realized_pnl_delta(r_delta);
@@ -263,11 +291,12 @@ impl Engine {
             account.initial_cash_set = false;
         }
         self.positions.clear();
+        self.lots.clear();
         self.marks.clear();
         self.fx_rates.clear();
     }
 
-    fn apply_fill(&mut self, fill: &Fill, ts_unix_ns: i64) -> Result<(PositionKey, Money, Money)> {
+    fn apply_fill(&mut self, event: &Event, fill: &Fill) -> Result<(PositionKey, Money, Money)> {
         self.registry.ensure_account(fill.account_id)?;
         self.registry.ensure_book(fill.account_id, fill.book_id)?;
         let instrument = self.registry.instrument(fill.instrument_id)?.clone();
@@ -280,29 +309,78 @@ impl Engine {
         let valuation_config = self.valuation_config();
         let key = fill_position_key(fill);
 
-        let position = self.positions.remove(&key);
-        let mut outcome = apply_average_cost_fill(
-            AverageCostFillInput {
-                position,
-                fill,
-                instrument: &instrument,
-                account_currency,
-                config: AverageCostConfig {
-                    account_money_scale: self.config.account_money_scale,
-                    rounding: self.config.rounding_mode,
-                    allow_short: self.config.allow_short,
-                    allow_position_flip: self.config.allow_position_flip,
-                },
-                ts_unix_ns,
-            },
-            |money, to_currency_id| {
-                valuation::convert_money(money, to_currency_id, &self.fx_rates, valuation_config)
-            },
-        )?;
-        let cash_delta = outcome.cash_delta;
-        let realized_delta = outcome.realized_delta;
+        let (mut position, cash_delta, realized_delta) = match self.config.accounting_method {
+            AccountingMethod::AverageCost => {
+                let position = self.positions.remove(&key);
+                let outcome = apply_average_cost_fill(
+                    AverageCostFillInput {
+                        position,
+                        fill,
+                        instrument: &instrument,
+                        account_currency,
+                        config: AverageCostConfig {
+                            account_money_scale: self.config.account_money_scale,
+                            rounding: self.config.rounding_mode,
+                            allow_short: self.config.allow_short,
+                            allow_position_flip: self.config.allow_position_flip,
+                        },
+                        ts_unix_ns: event.ts_unix_ns,
+                    },
+                    |money, to_currency_id| {
+                        valuation::convert_money(
+                            money,
+                            to_currency_id,
+                            &self.fx_rates,
+                            valuation_config,
+                        )
+                    },
+                )?;
+                (outcome.position, outcome.cash_delta, outcome.realized_delta)
+            }
+            AccountingMethod::Fifo | AccountingMethod::Lifo => {
+                let position = self.positions.remove(&key);
+                let lots = self
+                    .lots
+                    .iter()
+                    .filter(|((lot_key, _), _)| *lot_key == key)
+                    .map(|(_, lot)| lot.clone())
+                    .collect();
+                let outcome = apply_lot_fill(
+                    LotFillInput {
+                        position,
+                        lots,
+                        fill,
+                        instrument: &instrument,
+                        account_currency,
+                        config: LotAccountingConfig {
+                            account_money_scale: self.config.account_money_scale,
+                            rounding: self.config.rounding_mode,
+                            allow_short: self.config.allow_short,
+                            allow_position_flip: self.config.allow_position_flip,
+                            method: self.config.accounting_method,
+                        },
+                        seq: event.seq,
+                        event_id: event.event_id,
+                        ts_unix_ns: event.ts_unix_ns,
+                    },
+                    |money, to_currency_id| {
+                        valuation::convert_money(
+                            money,
+                            to_currency_id,
+                            &self.fx_rates,
+                            valuation_config,
+                        )
+                    },
+                )?;
+                self.lots.retain(|(lot_key, _), _| *lot_key != key);
+                for lot in outcome.lots {
+                    self.lots.insert((key, lot.lot_id), lot);
+                }
+                (outcome.position, outcome.cash_delta, outcome.realized_delta)
+            }
+        };
         valuation::revalue_position(
-            &mut outcome.position,
+            &mut position,
             &instrument,
             account_currency,
             self.marks.get(&key.instrument_id),
@@ -314,8 +392,8 @@ impl Engine {
         account.cash = account.cash.checked_add(cash_delta)?;
         account.realized_pnl = account.realized_pnl.checked_add(realized_delta)?;
 
-        self.positions.insert(key, outcome.position);
-        Ok((outcome.key, cash_delta, realized_delta))
+        self.positions.insert(key, position);
+        Ok((key, cash_delta, realized_delta))
     }
 
     fn apply_mark(

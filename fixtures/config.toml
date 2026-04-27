@@ -1,5 +1,6 @@
 base_currency = "USD"
 account_money_scale = 4
+accounting_method = "average_cost"
 allow_short = true
 allow_position_flip = true
 expected_start_seq = 1
@@ -10,4 +11,3 @@ account_id = 1
 [[books]]
 account_id = 1
 book_id = 1
-

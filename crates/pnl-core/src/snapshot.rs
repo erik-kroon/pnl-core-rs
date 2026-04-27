@@ -6,24 +6,46 @@ use crate::error::{Error, Result};
 use crate::metadata::AccountMeta;
 use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
-use crate::state_hash::{hash_canonical_state, CanonicalStateV1, StateHash};
+use crate::state_hash::{hash_canonical_state, CanonicalStateV2, StateHash};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotMetadataV1 {
-    pub snapshot_sequence: u64,
+pub struct SnapshotMetadataV2 {
     pub last_applied_event_seq: u64,
     pub state_hash: StateHash,
+    pub producer: String,
+    pub build_version: String,
+    pub fixture_identifier: Option<String>,
+    pub user_notes: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotMetadataOptions {
+    pub producer: String,
+    pub build_version: String,
+    pub fixture_identifier: Option<String>,
+    pub user_notes: Option<String>,
+}
+
+impl Default for SnapshotMetadataOptions {
+    fn default() -> Self {
+        Self {
+            producer: "pnl-core-rs".to_string(),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
+            fixture_identifier: None,
+            user_notes: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotV1 {
-    pub metadata: SnapshotMetadataV1,
-    pub state: CanonicalStateV1,
+pub struct SnapshotV2 {
+    pub metadata: SnapshotMetadataV2,
+    pub state: CanonicalStateV2,
 }
 
-impl CanonicalStateV1 {
+impl CanonicalStateV2 {
     fn into_engine(self) -> Engine {
         let accounts = self.accounts;
         let registry = Registry::from_parts(
@@ -60,6 +82,12 @@ impl CanonicalStateV1 {
                 .map(|account| (account.account_id, account))
                 .collect(),
             positions: self.positions.into_iter().map(|p| (p.key, p)).collect(),
+            lots: self
+                .lots
+                .into_iter()
+                .map(|lot| (lot.position_key(), lot.lot_id, lot))
+                .map(|(key, lot_id, lot)| ((key, lot_id), lot))
+                .collect(),
             marks: self
                 .marks
                 .into_iter()
@@ -80,20 +108,27 @@ impl CanonicalStateV1 {
 }
 
 impl Engine {
-    pub fn snapshot(&self) -> Result<SnapshotV1> {
-        let state = CanonicalStateV1::from_engine(self);
+    pub fn snapshot(&self) -> Result<SnapshotV2> {
+        self.snapshot_with_metadata(SnapshotMetadataOptions::default())
+    }
+
+    pub fn snapshot_with_metadata(&self, options: SnapshotMetadataOptions) -> Result<SnapshotV2> {
+        let state = CanonicalStateV2::from_engine(self);
         let state_hash = hash_canonical_state(&state);
-        Ok(SnapshotV1 {
-            metadata: SnapshotMetadataV1 {
-                snapshot_sequence: self.replay_journal.last_seq(),
+        Ok(SnapshotV2 {
+            metadata: SnapshotMetadataV2 {
                 last_applied_event_seq: self.replay_journal.last_seq(),
                 state_hash,
+                producer: options.producer,
+                build_version: options.build_version,
+                fixture_identifier: options.fixture_identifier,
+                user_notes: options.user_notes,
             },
             state,
         })
     }
 
-    pub fn restore(snapshot: SnapshotV1) -> Result<Self> {
+    pub fn restore(snapshot: SnapshotV2) -> Result<Self> {
         let hash = hash_canonical_state(&snapshot.state);
         if hash != snapshot.metadata.state_hash {
             return Err(Error::SnapshotHashMismatch);
@@ -108,6 +143,15 @@ impl Engine {
         codec::write_snapshot(&snapshot, writer)
     }
 
+    pub fn write_snapshot_with_metadata<W: Write>(
+        &self,
+        writer: W,
+        options: SnapshotMetadataOptions,
+    ) -> Result<()> {
+        let snapshot = self.snapshot_with_metadata(options)?;
+        codec::write_snapshot(&snapshot, writer)
+    }
+
     pub fn read_snapshot<R: Read>(reader: R) -> Result<Self> {
         let snapshot = codec::read_snapshot(reader)?;
         Self::restore(snapshot)
@@ -115,6 +159,16 @@ impl Engine {
 
     pub fn write_snapshot_json<W: Write>(&self, writer: W) -> Result<()> {
         let snapshot = self.snapshot()?;
+        serde_json::to_writer_pretty(writer, &snapshot)?;
+        Ok(())
+    }
+
+    pub fn write_snapshot_json_with_metadata<W: Write>(
+        &self,
+        writer: W,
+        options: SnapshotMetadataOptions,
+    ) -> Result<()> {
+        let snapshot = self.snapshot_with_metadata(options)?;
         serde_json::to_writer_pretty(writer, &snapshot)?;
         Ok(())
     }

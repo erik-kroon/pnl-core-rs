@@ -115,6 +115,38 @@ fn restored_snapshot_can_correct_prior_fill() {
 }
 
 #[test]
+fn snapshot_metadata_records_producer_build_fixture_and_notes() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+
+    let snapshot = engine
+        .snapshot_with_metadata(SnapshotMetadataOptions {
+            producer: "integration-test".to_string(),
+            build_version: "1.2.3-test".to_string(),
+            fixture_identifier: Some("fixture-a".to_string()),
+            user_notes: Some("captured before resume".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(snapshot.metadata.last_applied_event_seq, 1);
+    assert_eq!(snapshot.metadata.state_hash, engine.state_hash());
+    assert_eq!(snapshot.metadata.producer, "integration-test");
+    assert_eq!(snapshot.metadata.build_version, "1.2.3-test");
+    assert_eq!(
+        snapshot.metadata.fixture_identifier.as_deref(),
+        Some("fixture-a")
+    );
+    assert_eq!(
+        snapshot.metadata.user_notes.as_deref(),
+        Some("captured before resume")
+    );
+    assert_eq!(
+        Engine::restore(snapshot).unwrap().state_hash(),
+        engine.state_hash()
+    );
+}
+
+#[test]
 fn cross_currency_fill_requires_direct_fx_rate() {
     let mut engine = setup_eur_instrument_usd_account();
     engine.apply(initial(1, "10000.00")).unwrap();
@@ -242,6 +274,255 @@ fn cash_adjustment_is_external_flow_not_pnl() {
     assert_eq!(summary.total_pnl, money("0.00"));
     assert_eq!(summary.net_external_cash_flows, money("250.00"));
     assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn fifo_and_lifo_realize_against_different_lots() {
+    let mut fifo = setup_with_accounting_method(AccountingMethod::Fifo);
+    fifo.apply(initial(1, "10000.00")).unwrap();
+    fifo.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    fifo.apply(fill(3, Side::Buy, 100, "20.00", "0")).unwrap();
+    fifo.apply(fill(4, Side::Sell, 100, "15.00", "0")).unwrap();
+
+    let fifo_summary = fifo.account_summary(ACCOUNT).unwrap();
+    let fifo_lots: Vec<_> = fifo.lots_for_position(position_key()).collect();
+    assert_eq!(fifo_summary.realized_pnl, money("500.00"));
+    assert_eq!(
+        fifo.position(position_key()).unwrap().cost_basis,
+        money("2000.00")
+    );
+    assert_eq!(fifo_lots.len(), 1);
+    assert_eq!(fifo_lots[0].lot_id.source_event_id, EventId(3));
+    assert_eq!(fifo_lots[0].side, PositionSide::Long);
+    assert_eq!(fifo_lots[0].remaining_qty, Qty::from_units(100));
+    assert_eq!(fifo_lots[0].remaining_cost_basis, money("2000.00"));
+
+    let mut lifo = setup_with_accounting_method(AccountingMethod::Lifo);
+    lifo.apply(initial(1, "10000.00")).unwrap();
+    lifo.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    lifo.apply(fill(3, Side::Buy, 100, "20.00", "0")).unwrap();
+    lifo.apply(fill(4, Side::Sell, 100, "15.00", "0")).unwrap();
+
+    let lifo_summary = lifo.account_summary(ACCOUNT).unwrap();
+    let lifo_lots: Vec<_> = lifo.lots_for_position(position_key()).collect();
+    assert_eq!(lifo_summary.realized_pnl, money("-500.00"));
+    assert_eq!(
+        lifo.position(position_key()).unwrap().cost_basis,
+        money("1000.00")
+    );
+    assert_eq!(lifo_lots.len(), 1);
+    assert_eq!(lifo_lots[0].lot_id.source_event_id, EventId(2));
+    assert_eq!(lifo_lots[0].remaining_cost_basis, money("1000.00"));
+}
+
+#[test]
+fn fifo_flip_opens_residual_short_lot_with_deterministic_identity_and_fee_realized() {
+    let mut engine = setup_with_accounting_method(AccountingMethod::Fifo);
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    engine
+        .apply(fill(3, Side::Sell, 150, "12.00", "1.50"))
+        .unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let position = engine.position(position_key()).unwrap();
+    let lots: Vec<_> = engine.lots_for_position(position_key()).collect();
+
+    assert_eq!(position.signed_qty, Qty::from_units(-50));
+    assert_eq!(position.cost_basis, money("-600.00"));
+    assert_eq!(summary.cash, money("10798.50"));
+    assert_eq!(summary.realized_pnl, money("198.50"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+    assert_eq!(lots.len(), 1);
+    assert_eq!(
+        lots[0].lot_id,
+        LotId {
+            source_event_id: EventId(3),
+            leg_index: 1
+        }
+    );
+    assert_eq!(lots[0].side, PositionSide::Short);
+    assert_eq!(lots[0].original_qty, Qty::from_units(50));
+    assert_eq!(lots[0].remaining_qty, Qty::from_units(50));
+    assert_eq!(
+        lots[0].entry_price,
+        price("12.00").to_scale(4, RoundingMode::HalfEven).unwrap()
+    );
+    assert_eq!(lots[0].remaining_cost_basis, money("-600.00"));
+}
+
+#[test]
+fn fifo_lots_rebuild_after_trade_correction_and_snapshot_restore() {
+    let mut engine = setup_with_accounting_method(AccountingMethod::Fifo);
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    engine.apply(fill(3, Side::Buy, 100, "20.00", "0")).unwrap();
+    engine
+        .apply(fill(4, Side::Sell, 100, "15.00", "0"))
+        .unwrap();
+
+    let replacement = replacement_fill(Side::Buy, 100, "8.00", "0", CurrencyId::usd());
+    engine
+        .apply(correct_fill(5, EventId(2), replacement))
+        .unwrap();
+
+    assert_eq!(
+        engine.account_summary(ACCOUNT).unwrap().realized_pnl,
+        money("700.00")
+    );
+    let lots: Vec<_> = engine.lots_for_position(position_key()).collect();
+    assert_eq!(lots.len(), 1);
+    assert_eq!(lots[0].lot_id.source_event_id, EventId(3));
+    assert_eq!(lots[0].remaining_cost_basis, money("2000.00"));
+
+    let mut bytes = Vec::new();
+    engine.write_snapshot(&mut bytes).unwrap();
+    let restored = Engine::read_snapshot(bytes.as_slice()).unwrap();
+    let restored_lots: Vec<_> = restored.lots_for_position(position_key()).collect();
+    assert_eq!(restored_lots, lots);
+    assert_eq!(restored.state_hash(), engine.state_hash());
+}
+
+#[test]
+fn fifo_direct_fx_lots_store_entry_basis_and_close_at_current_rate() {
+    let mut engine =
+        setup_eur_instrument_usd_account_with_accounting_method(AccountingMethod::Fifo);
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine
+        .apply(fx(2, eur(), CurrencyId::usd(), "1.10"))
+        .unwrap();
+    engine.apply(fill(3, Side::Buy, 10, "100.00", "0")).unwrap();
+    engine
+        .apply(fx(4, eur(), CurrencyId::usd(), "1.20"))
+        .unwrap();
+    engine.apply(fill(5, Side::Sell, 4, "110.00", "0")).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let lots: Vec<_> = engine.lots_for_position(position_key()).collect();
+    assert_eq!(summary.realized_pnl, money("88.00"));
+    assert_eq!(
+        engine.position(position_key()).unwrap().cost_basis,
+        money("660.00")
+    );
+    assert_eq!(lots.len(), 1);
+    assert_eq!(lots[0].remaining_qty, Qty::from_units(6));
+    assert_eq!(lots[0].remaining_cost_basis, money("660.00"));
+}
+
+#[test]
+fn multi_account_and_multi_book_replay_stays_isolated() {
+    let mut engine = setup();
+    engine
+        .register_account(AccountMeta {
+            account_id: AccountId(2),
+            base_currency: CurrencyId::usd(),
+        })
+        .unwrap();
+    engine
+        .register_book(BookMeta {
+            account_id: ACCOUNT,
+            book_id: BookId(2),
+        })
+        .unwrap();
+    engine
+        .register_book(BookMeta {
+            account_id: AccountId(2),
+            book_id: BOOK,
+        })
+        .unwrap();
+
+    engine
+        .apply_many([
+            initial(1, "1000.00"),
+            Event {
+                seq: 2,
+                event_id: EventId(2),
+                ts_unix_ns: 2,
+                kind: EventKind::InitialCash(InitialCash {
+                    account_id: AccountId(2),
+                    currency_id: CurrencyId::usd(),
+                    amount: money("2000.00"),
+                }),
+            },
+            fill(3, Side::Buy, 10, "10.00", "0"),
+            Event {
+                seq: 4,
+                event_id: EventId(4),
+                ts_unix_ns: 4,
+                kind: EventKind::Fill(Fill {
+                    account_id: ACCOUNT,
+                    book_id: BookId(2),
+                    instrument_id: INSTRUMENT,
+                    side: Side::Buy,
+                    qty: Qty::from_units(5),
+                    price: price("20.00"),
+                    fee: money("0"),
+                }),
+            },
+            Event {
+                seq: 5,
+                event_id: EventId(5),
+                ts_unix_ns: 5,
+                kind: EventKind::Fill(Fill {
+                    account_id: AccountId(2),
+                    book_id: BOOK,
+                    instrument_id: INSTRUMENT,
+                    side: Side::Sell,
+                    qty: Qty::from_units(3),
+                    price: price("30.00"),
+                    fee: money("0"),
+                }),
+            },
+            mark(6, "12.00"),
+        ])
+        .unwrap();
+
+    let account_one = engine.account_summary(ACCOUNT).unwrap();
+    let account_two = engine.account_summary(AccountId(2)).unwrap();
+    assert_eq!(account_one.cash, money("800.00"));
+    assert_eq!(account_one.open_positions, 2);
+    assert_eq!(account_one.position_market_value, money("180.00"));
+    assert_eq!(account_one.unrealized_pnl, money("-20.00"));
+    assert_eq!(account_two.cash, money("2090.00"));
+    assert_eq!(account_two.open_positions, 1);
+    assert_eq!(account_two.position_market_value, money("-36.00"));
+    assert_eq!(account_two.unrealized_pnl, money("54.00"));
+    assert_eq!(account_one.pnl_reconciliation_delta, money("0.00"));
+    assert_eq!(account_two.pnl_reconciliation_delta, money("0.00"));
+
+    assert_eq!(
+        engine
+            .position(PositionKey {
+                account_id: ACCOUNT,
+                book_id: BOOK,
+                instrument_id: INSTRUMENT,
+            })
+            .unwrap()
+            .signed_qty,
+        Qty::from_units(10)
+    );
+    assert_eq!(
+        engine
+            .position(PositionKey {
+                account_id: ACCOUNT,
+                book_id: BookId(2),
+                instrument_id: INSTRUMENT,
+            })
+            .unwrap()
+            .signed_qty,
+        Qty::from_units(5)
+    );
+    assert_eq!(
+        engine
+            .position(PositionKey {
+                account_id: AccountId(2),
+                book_id: BOOK,
+                instrument_id: INSTRUMENT,
+            })
+            .unwrap()
+            .signed_qty,
+        Qty::from_units(-3)
+    );
 }
 
 #[test]
@@ -408,4 +689,46 @@ proptest! {
             money("0.00")
         );
     }
+
+    #[test]
+    fn generated_fill_sequences_with_fees_rebates_and_flips_reconcile(
+        fills in proptest::collection::vec(
+            (any::<bool>(), 1_i128..75, 1_u16..250, -75_i16..150),
+            1..50,
+        )
+    ) {
+        let mut engine = setup();
+        engine.apply(initial(1, "1000000.00")).unwrap();
+        let mut expected_qty = 0_i128;
+
+        for (idx, (is_buy, qty, whole_price, fee_cents)) in fills.iter().enumerate() {
+            let side = if *is_buy { Side::Buy } else { Side::Sell };
+            expected_qty += if *is_buy { *qty } else { -*qty };
+            let seq = idx as u64 + 2;
+            let px = format!("{whole_price}.00");
+            let fee = cents_to_decimal(*fee_cents);
+            engine.apply(fill(seq, side, *qty, &px, &fee)).unwrap();
+
+            prop_assert_eq!(
+                engine.account_summary(ACCOUNT).unwrap().pnl_reconciliation_delta,
+                money("0.00"),
+                "reconciliation failed after sequence {}",
+                seq
+            );
+        }
+
+        let position = engine.position(position_key()).unwrap();
+        prop_assert_eq!(position.signed_qty.value, expected_qty);
+        if expected_qty == 0 {
+            prop_assert_eq!(position.avg_price, None);
+        } else {
+            prop_assert!(position.avg_price.is_some());
+        }
+    }
+}
+
+fn cents_to_decimal(cents: i16) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.unsigned_abs();
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
 }

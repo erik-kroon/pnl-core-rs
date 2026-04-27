@@ -1,0 +1,591 @@
+{
+  "metadata": {
+    "last_applied_event_seq": 11,
+    "state_hash": [
+      140,
+      214,
+      67,
+      37,
+      107,
+      23,
+      253,
+      61,
+      3,
+      187,
+      18,
+      63,
+      218,
+      99,
+      240,
+      20,
+      60,
+      20,
+      103,
+      148,
+      172,
+      194,
+      225,
+      253,
+      64,
+      213,
+      190,
+      55,
+      177,
+      38,
+      216,
+      9
+    ],
+    "producer": "pnl-core-rs",
+    "build_version": "0.1.0",
+    "fixture_identifier": null,
+    "user_notes": null
+  },
+  "state": {
+    "config": {
+      "base_currency": 5591876,
+      "account_money_scale": 4,
+      "rounding_mode": "HalfEven",
+      "accounting_method": "Lifo",
+      "cash_authoritative": true,
+      "allow_short": true,
+      "allow_position_flip": true,
+      "expected_start_seq": 1
+    },
+    "currencies": [
+      {
+        "currency_id": 4543826,
+        "code": "EUR",
+        "scale": 4
+      },
+      {
+        "currency_id": 5591876,
+        "code": "USD",
+        "scale": 4
+      }
+    ],
+    "accounts": [
+      {
+        "account_id": 1,
+        "base_currency": 5591876,
+        "initial_cash": {
+          "amount": 100000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "cash": {
+          "amount": 79968000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "net_external_cash_flows": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "realized_pnl": {
+          "amount": -32000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "peak_equity": {
+          "amount": 104068000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "current_drawdown": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "max_drawdown": {
+          "amount": -22000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "initial_cash_set": true
+      },
+      {
+        "account_id": 2,
+        "base_currency": 5591876,
+        "initial_cash": {
+          "amount": 50000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "cash": {
+          "amount": 51000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "net_external_cash_flows": {
+          "amount": 1000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "realized_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "peak_equity": {
+          "amount": 51000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "current_drawdown": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "max_drawdown": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "initial_cash_set": true
+      }
+    ],
+    "books": [
+      {
+        "account_id": 1,
+        "book_id": 1
+      },
+      {
+        "account_id": 1,
+        "book_id": 2
+      },
+      {
+        "account_id": 2,
+        "book_id": 1
+      }
+    ],
+    "instruments": [
+      {
+        "instrument_id": 1,
+        "symbol": "AAPL",
+        "currency_id": 5591876,
+        "price_scale": 4,
+        "qty_scale": 0,
+        "multiplier": {
+          "value": 1,
+          "scale": 0
+        }
+      },
+      {
+        "instrument_id": 2,
+        "symbol": "SAP",
+        "currency_id": 4543826,
+        "price_scale": 4,
+        "qty_scale": 0,
+        "multiplier": {
+          "value": 1,
+          "scale": 0
+        }
+      }
+    ],
+    "positions": [
+      {
+        "key": {
+          "account_id": 1,
+          "book_id": 1,
+          "instrument_id": 1
+        },
+        "signed_qty": {
+          "value": 100,
+          "scale": 0
+        },
+        "avg_price": {
+          "value": 90000,
+          "scale": 4
+        },
+        "cost_basis": {
+          "amount": 9000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "realized_pnl": {
+          "amount": -10000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "unrealized_pnl": {
+          "amount": 3000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "gross_exposure": {
+          "amount": 12000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "net_exposure": {
+          "amount": 12000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "opened_at_unix_ns": 3,
+        "updated_at_unix_ns": 3
+      },
+      {
+        "key": {
+          "account_id": 1,
+          "book_id": 2,
+          "instrument_id": 2
+        },
+        "signed_qty": {
+          "value": 10,
+          "scale": 0
+        },
+        "avg_price": {
+          "value": 1000000,
+          "scale": 4
+        },
+        "cost_basis": {
+          "amount": 11000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "realized_pnl": {
+          "amount": -22000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "unrealized_pnl": {
+          "amount": 1100000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "gross_exposure": {
+          "amount": 12100000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "net_exposure": {
+          "amount": 12100000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "opened_at_unix_ns": 6,
+        "updated_at_unix_ns": 6
+      }
+    ],
+    "lots": [
+      {
+        "lot_id": {
+          "source_event_id": 3,
+          "leg_index": 0
+        },
+        "account_id": 1,
+        "book_id": 1,
+        "instrument_id": 1,
+        "side": "Long",
+        "original_qty": {
+          "value": 100,
+          "scale": 0
+        },
+        "remaining_qty": {
+          "value": 100,
+          "scale": 0
+        },
+        "entry_price": {
+          "value": 90000,
+          "scale": 4
+        },
+        "remaining_cost_basis": {
+          "amount": 9000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "opened_event_id": 3,
+        "opened_seq": 3,
+        "opened_at_unix_ns": 3
+      },
+      {
+        "lot_id": {
+          "source_event_id": 6,
+          "leg_index": 0
+        },
+        "account_id": 1,
+        "book_id": 2,
+        "instrument_id": 2,
+        "side": "Long",
+        "original_qty": {
+          "value": 10,
+          "scale": 0
+        },
+        "remaining_qty": {
+          "value": 10,
+          "scale": 0
+        },
+        "entry_price": {
+          "value": 1000000,
+          "scale": 4
+        },
+        "remaining_cost_basis": {
+          "amount": 11000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "opened_event_id": 6,
+        "opened_seq": 6,
+        "opened_at_unix_ns": 6
+      }
+    ],
+    "marks": [
+      {
+        "instrument_id": 1,
+        "price": {
+          "value": 120000,
+          "scale": 4
+        },
+        "ts_unix_ns": 4
+      },
+      {
+        "instrument_id": 2,
+        "price": {
+          "value": 1100000,
+          "scale": 4
+        },
+        "ts_unix_ns": 11
+      }
+    ],
+    "fx_rates": [
+      {
+        "from_currency_id": 4543826,
+        "to_currency_id": 5591876,
+        "rate": {
+          "value": 110,
+          "scale": 2
+        },
+        "ts_unix_ns": 5
+      }
+    ],
+    "seen_events": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "event_log": [
+      {
+        "seq": 1,
+        "event_id": 1,
+        "ts_unix_ns": 1,
+        "kind": {
+          "InitialCash": {
+            "account_id": 1,
+            "currency_id": 5591876,
+            "amount": {
+              "amount": 100000000,
+              "scale": 4,
+              "currency_id": 5591876
+            }
+          }
+        }
+      },
+      {
+        "seq": 2,
+        "event_id": 2,
+        "ts_unix_ns": 2,
+        "kind": {
+          "InitialCash": {
+            "account_id": 2,
+            "currency_id": 5591876,
+            "amount": {
+              "amount": 50000000,
+              "scale": 4,
+              "currency_id": 5591876
+            }
+          }
+        }
+      },
+      {
+        "seq": 3,
+        "event_id": 3,
+        "ts_unix_ns": 3,
+        "kind": {
+          "Fill": {
+            "account_id": 1,
+            "book_id": 1,
+            "instrument_id": 1,
+            "side": "Buy",
+            "qty": {
+              "value": 100,
+              "scale": 0
+            },
+            "price": {
+              "value": 1000,
+              "scale": 2
+            },
+            "fee": {
+              "amount": 10000,
+              "scale": 4,
+              "currency_id": 5591876
+            }
+          }
+        }
+      },
+      {
+        "seq": 4,
+        "event_id": 4,
+        "ts_unix_ns": 4,
+        "kind": {
+          "Mark": {
+            "instrument_id": 1,
+            "price": {
+              "value": 1200,
+              "scale": 2
+            }
+          }
+        }
+      },
+      {
+        "seq": 5,
+        "event_id": 5,
+        "ts_unix_ns": 5,
+        "kind": {
+          "FxRate": {
+            "from_currency_id": 4543826,
+            "to_currency_id": 5591876,
+            "rate": {
+              "value": 110,
+              "scale": 2
+            }
+          }
+        }
+      },
+      {
+        "seq": 6,
+        "event_id": 6,
+        "ts_unix_ns": 6,
+        "kind": {
+          "Fill": {
+            "account_id": 1,
+            "book_id": 2,
+            "instrument_id": 2,
+            "side": "Buy",
+            "qty": {
+              "value": 10,
+              "scale": 0
+            },
+            "price": {
+              "value": 10000,
+              "scale": 2
+            },
+            "fee": {
+              "amount": 20000,
+              "scale": 4,
+              "currency_id": 4543826
+            }
+          }
+        }
+      },
+      {
+        "seq": 7,
+        "event_id": 7,
+        "ts_unix_ns": 7,
+        "kind": {
+          "Fill": {
+            "account_id": 2,
+            "book_id": 1,
+            "instrument_id": 1,
+            "side": "Sell",
+            "qty": {
+              "value": 50,
+              "scale": 0
+            },
+            "price": {
+              "value": 1100,
+              "scale": 2
+            },
+            "fee": {
+              "amount": -2500,
+              "scale": 4,
+              "currency_id": 5591876
+            }
+          }
+        }
+      },
+      {
+        "seq": 8,
+        "event_id": 8,
+        "ts_unix_ns": 8,
+        "kind": {
+          "CashAdjustment": {
+            "account_id": 2,
+            "currency_id": 5591876,
+            "amount": {
+              "amount": 1000000,
+              "scale": 4,
+              "currency_id": 5591876
+            },
+            "reason": "external transfer"
+          }
+        }
+      },
+      {
+        "seq": 9,
+        "event_id": 9,
+        "ts_unix_ns": 9,
+        "kind": {
+          "TradeCorrection": {
+            "original_event_id": 3,
+            "replacement": {
+              "account_id": 1,
+              "book_id": 1,
+              "instrument_id": 1,
+              "side": "Buy",
+              "qty": {
+                "value": 100,
+                "scale": 0
+              },
+              "price": {
+                "value": 900,
+                "scale": 2
+              },
+              "fee": {
+                "amount": 10000,
+                "scale": 4,
+                "currency_id": 5591876
+              }
+            },
+            "reason": "price correction"
+          }
+        }
+      },
+      {
+        "seq": 10,
+        "event_id": 10,
+        "ts_unix_ns": 10,
+        "kind": {
+          "TradeBust": {
+            "original_event_id": 7,
+            "reason": "venue bust"
+          }
+        }
+      },
+      {
+        "seq": 11,
+        "event_id": 11,
+        "ts_unix_ns": 11,
+        "kind": {
+          "Mark": {
+            "instrument_id": 2,
+            "price": {
+              "value": 11000,
+              "scale": 2
+            }
+          }
+        }
+      }
+    ],
+    "last_seq": 11
+  }
+}

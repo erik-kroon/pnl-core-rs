@@ -63,6 +63,8 @@ pub enum RoundingMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountingMethod {
     AverageCost,
+    Fifo,
+    Lifo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
