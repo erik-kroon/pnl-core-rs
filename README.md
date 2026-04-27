@@ -19,6 +19,9 @@ This repository contains the V1 Rust implementation:
 The crate is not a broker connector, order management system, strategy runtime,
 or settlement engine.
 
+See [ROADMAP.md](ROADMAP.md) for planned hardening and future accounting model
+candidates.
+
 ## What V1 Supports
 
 - Strict contiguous event replay.
