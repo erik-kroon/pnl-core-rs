@@ -25,10 +25,40 @@ pub(super) fn validate_restored_state(engine: &Engine) -> Result<()> {
         {
             return Err(Error::SnapshotValidation("account currency missing"));
         }
-        if account.cash.currency_id != account.base_currency
-            || account.cash.scale != engine.config.account_money_scale
-        {
-            return Err(Error::SnapshotValidation("invalid account cash"));
+        for money in [
+            account.cash,
+            account.initial_cash,
+            account.net_external_cash_flows,
+            account.trading_realized_pnl,
+            account.interest_pnl,
+            account.borrow_pnl,
+            account.funding_pnl,
+            account.financing_pnl,
+            account.total_financing_pnl,
+            account.realized_pnl,
+            account.peak_equity,
+            account.current_drawdown,
+            account.max_drawdown,
+        ] {
+            if money.currency_id != account.base_currency
+                || money.scale != engine.config.account_money_scale
+            {
+                return Err(Error::SnapshotValidation("invalid account money"));
+            }
+        }
+        let computed_financing = account
+            .interest_pnl
+            .checked_add(account.borrow_pnl)?
+            .checked_add(account.funding_pnl)?
+            .checked_add(account.financing_pnl)?;
+        if computed_financing != account.total_financing_pnl {
+            return Err(Error::SnapshotValidation("invalid financing buckets"));
+        }
+        let computed_realized = account
+            .trading_realized_pnl
+            .checked_add(account.total_financing_pnl)?;
+        if computed_realized != account.realized_pnl {
+            return Err(Error::SnapshotValidation("invalid realized pnl buckets"));
         }
     }
     for book in engine.registry.books() {
@@ -46,8 +76,19 @@ pub(super) fn validate_restored_state(engine: &Engine) -> Result<()> {
             .registry
             .ensure_currency(instrument.currency_id)
             .is_err()
+            || engine
+                .registry
+                .instrument_lifecycle(instrument.instrument_id)
+                .is_err()
         {
-            return Err(Error::SnapshotValidation("instrument currency missing"));
+            return Err(Error::SnapshotValidation("instrument metadata invalid"));
+        }
+    }
+    for lifecycle in engine.registry.instrument_lifecycles() {
+        if engine.registry.instrument(lifecycle.instrument_id).is_err() {
+            return Err(Error::SnapshotValidation(
+                "instrument lifecycle references missing instrument",
+            ));
         }
     }
     for rate in engine.fx_rates.values() {

@@ -1,6 +1,8 @@
 base_currency = "USD"
 account_money_scale = 4
 accounting_method = "average_cost"
+fx_allow_inverse = false
+fx_cross_rate_pivots = []
 allow_short = true
 allow_position_flip = true
 expected_start_seq = 1

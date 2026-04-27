@@ -49,7 +49,7 @@ impl Scenario {
         })
     }
 
-    fn engine_with_config(self, config: EngineConfig) -> Engine {
+    pub fn engine_with_config(self, config: EngineConfig) -> Engine {
         let mut engine = Engine::new(config);
         engine
             .register_currency(CurrencyMeta {
@@ -127,6 +127,25 @@ impl Scenario {
         }
     }
 
+    pub fn financing_event(
+        self,
+        seq: u64,
+        amount: &str,
+        kind: fn(FinancingEvent) -> EventKind,
+    ) -> Event {
+        Event {
+            seq,
+            event_id: EventId(seq),
+            ts_unix_ns: seq as i64,
+            kind: kind(FinancingEvent {
+                account_id: self.account_id,
+                currency_id: self.account_currency_id,
+                amount: money_in(amount, self.account_currency_id),
+                reason: Some("test financing".to_string()),
+            }),
+        }
+    }
+
     pub fn fill(self, seq: u64, side: Side, qty: i128, px: &str, fee: &str) -> Event {
         self.fill_with_fee_currency(seq, side, qty, px, fee, self.account_currency_id)
     }
@@ -198,6 +217,46 @@ impl Scenario {
         }
     }
 
+    pub fn split(self, seq: u64, numerator: u32, denominator: u32) -> Event {
+        Event {
+            seq,
+            event_id: EventId(seq),
+            ts_unix_ns: seq as i64,
+            kind: EventKind::Split(InstrumentSplit {
+                instrument_id: self.instrument_id,
+                numerator,
+                denominator,
+                reason: Some("test split".to_string()),
+            }),
+        }
+    }
+
+    pub fn symbol_change(self, seq: u64, symbol: &str) -> Event {
+        Event {
+            seq,
+            event_id: EventId(seq),
+            ts_unix_ns: seq as i64,
+            kind: EventKind::SymbolChange(InstrumentSymbolChange {
+                instrument_id: self.instrument_id,
+                symbol: symbol.to_string(),
+                reason: Some("test symbol change".to_string()),
+            }),
+        }
+    }
+
+    pub fn instrument_lifecycle(self, seq: u64, state: InstrumentLifecycleState) -> Event {
+        Event {
+            seq,
+            event_id: EventId(seq),
+            ts_unix_ns: seq as i64,
+            kind: EventKind::InstrumentLifecycle(InstrumentLifecycle {
+                instrument_id: self.instrument_id,
+                state,
+                reason: Some("test lifecycle".to_string()),
+            }),
+        }
+    }
+
     pub fn correct_fill(self, seq: u64, original_event_id: EventId, replacement: Fill) -> Event {
         Event {
             seq,
@@ -250,12 +309,32 @@ pub fn setup_eur_instrument_usd_account_with_accounting_method(
     Scenario::eur_instrument_usd_account().engine_with_accounting_method(accounting_method)
 }
 
+pub fn setup_eur_instrument_usd_account_with_config(config: EngineConfig) -> Engine {
+    Scenario::eur_instrument_usd_account().engine_with_config(config)
+}
+
 pub fn initial(seq: u64, amount: &str) -> Event {
     Scenario::default().initial_cash(seq, amount)
 }
 
 pub fn cash(seq: u64, amount: &str) -> Event {
     Scenario::default().cash_adjustment(seq, amount)
+}
+
+pub fn interest(seq: u64, amount: &str) -> Event {
+    Scenario::default().financing_event(seq, amount, EventKind::Interest)
+}
+
+pub fn borrow(seq: u64, amount: &str) -> Event {
+    Scenario::default().financing_event(seq, amount, EventKind::Borrow)
+}
+
+pub fn funding(seq: u64, amount: &str) -> Event {
+    Scenario::default().financing_event(seq, amount, EventKind::Funding)
+}
+
+pub fn financing(seq: u64, amount: &str) -> Event {
+    Scenario::default().financing_event(seq, amount, EventKind::Financing)
 }
 
 pub fn fill(seq: u64, side: Side, qty: i128, px: &str, fee: &str) -> Event {
@@ -291,6 +370,18 @@ pub fn fx(seq: u64, from_currency_id: CurrencyId, to_currency_id: CurrencyId, ra
     Scenario::default().fx(seq, from_currency_id, to_currency_id, rate)
 }
 
+pub fn split(seq: u64, numerator: u32, denominator: u32) -> Event {
+    Scenario::default().split(seq, numerator, denominator)
+}
+
+pub fn symbol_change(seq: u64, symbol: &str) -> Event {
+    Scenario::default().symbol_change(seq, symbol)
+}
+
+pub fn instrument_lifecycle(seq: u64, state: InstrumentLifecycleState) -> Event {
+    Scenario::default().instrument_lifecycle(seq, state)
+}
+
 pub fn correct_fill(seq: u64, original_event_id: EventId, replacement: Fill) -> Event {
     Scenario::default().correct_fill(seq, original_event_id, replacement)
 }
@@ -305,6 +396,10 @@ pub fn position_key() -> PositionKey {
 
 pub fn eur() -> CurrencyId {
     CurrencyId::from_code("EUR").unwrap()
+}
+
+pub fn gbp() -> CurrencyId {
+    CurrencyId::from_code("GBP").unwrap()
 }
 
 pub fn money(value: &str) -> Money {

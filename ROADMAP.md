@@ -42,15 +42,15 @@ roadmap below is organized by product maturity rather than calendar dates.
   selection.
 - FIFO/LIFO realized PnL policies for downstream reporting.
 - Public open-lot inspection.
+- Opt-in inverse FX lookup and configured one-pivot cross-rate routing.
+- Corporate-action-style adjustment events for splits and symbol/instrument
+  lifecycle changes.
 - Snapshot format version `2` with lot state in the canonical hash material.
 
 ## Future Accounting Model Candidates
 
-- Corporate-action-style adjustment events for splits and symbol/instrument
-  lifecycle changes.
-- Explicit interest, borrow, funding, and financing events.
-- More expressive FX handling, potentially including inverse lookup or routed
-  cross rates when explicitly configured.
+- More expressive FX handling beyond one configured pivot when explicitly
+  configured.
 - Instrument classes beyond the current spot-like model. Futures must use
   futures-specific equity and exposure semantics rather than spot-like notional
   cash behavior.

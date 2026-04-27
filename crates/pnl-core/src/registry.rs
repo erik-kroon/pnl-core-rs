@@ -1,5 +1,8 @@
 use crate::error::{Error, Result};
-use crate::metadata::{AccountMeta, BookMeta, CurrencyMeta, InstrumentMeta};
+use crate::metadata::{
+    AccountMeta, BookMeta, CurrencyMeta, InstrumentLifecycleMeta, InstrumentLifecycleState,
+    InstrumentMeta,
+};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,6 +13,7 @@ pub(crate) struct Registry {
     accounts: BTreeMap<AccountId, AccountMeta>,
     books: BTreeSet<(AccountId, BookId)>,
     instruments: BTreeMap<InstrumentId, InstrumentMeta>,
+    instrument_lifecycles: BTreeMap<InstrumentId, InstrumentLifecycleState>,
 }
 
 impl Registry {
@@ -22,12 +26,14 @@ impl Registry {
         accounts: BTreeMap<AccountId, AccountMeta>,
         books: BTreeSet<(AccountId, BookId)>,
         instruments: BTreeMap<InstrumentId, InstrumentMeta>,
+        instrument_lifecycles: BTreeMap<InstrumentId, InstrumentLifecycleState>,
     ) -> Self {
         Self {
             currencies,
             accounts,
             books,
             instruments,
+            instrument_lifecycles,
         }
     }
 
@@ -44,6 +50,15 @@ impl Registry {
 
     pub fn instruments(&self) -> impl Iterator<Item = &InstrumentMeta> {
         self.instruments.values()
+    }
+
+    pub fn instrument_lifecycles(&self) -> impl Iterator<Item = InstrumentLifecycleMeta> + '_ {
+        self.instrument_lifecycles
+            .iter()
+            .map(|(instrument_id, state)| InstrumentLifecycleMeta {
+                instrument_id: *instrument_id,
+                state: *state,
+            })
     }
 
     pub fn register_currency(&mut self, meta: CurrencyMeta, account_money_scale: u8) -> Result<()> {
@@ -80,12 +95,66 @@ impl Registry {
         if meta.multiplier.value <= 0 {
             return Err(Error::InvalidScale);
         }
-        insert_idempotent(
+        let inserted = insert_idempotent(
             &mut self.instruments,
             meta.instrument_id,
-            meta,
+            meta.clone(),
             "instrument registration conflicts with existing metadata",
         )?;
+        if inserted {
+            self.instrument_lifecycles
+                .insert(meta.instrument_id, InstrumentLifecycleState::Active);
+        }
+        Ok(())
+    }
+
+    pub fn update_instrument_symbol(
+        &mut self,
+        instrument_id: InstrumentId,
+        symbol: String,
+    ) -> Result<()> {
+        if symbol.trim().is_empty() {
+            return Err(Error::InvalidSymbol);
+        }
+        let instrument = self
+            .instruments
+            .get_mut(&instrument_id)
+            .ok_or(Error::UnknownInstrument(instrument_id))?;
+        instrument.symbol = symbol;
+        Ok(())
+    }
+
+    pub fn set_instrument_lifecycle(
+        &mut self,
+        instrument_id: InstrumentId,
+        state: InstrumentLifecycleState,
+    ) -> Result<()> {
+        self.instrument(instrument_id)?;
+        self.instrument_lifecycles.insert(instrument_id, state);
+        Ok(())
+    }
+
+    pub fn reset_instrument_lifecycles(&mut self) {
+        for state in self.instrument_lifecycles.values_mut() {
+            *state = InstrumentLifecycleState::Active;
+        }
+    }
+
+    pub fn instrument_lifecycle(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Result<InstrumentLifecycleState> {
+        self.instrument_lifecycles
+            .get(&instrument_id)
+            .copied()
+            .ok_or(Error::UnknownInstrument(instrument_id))
+    }
+
+    pub fn ensure_instrument_tradeable(&self, instrument_id: InstrumentId) -> Result<()> {
+        let state = self.instrument_lifecycle(instrument_id)?;
+        if state != InstrumentLifecycleState::Active {
+            return Err(Error::InactiveInstrument(instrument_id));
+        }
         Ok(())
     }
 

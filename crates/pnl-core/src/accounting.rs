@@ -1,11 +1,51 @@
+use crate::account::AccountState;
 use crate::error::{Error, Result};
 use crate::event::Fill;
 use crate::metadata::InstrumentMeta;
-use crate::position::{Lot, LotId, Position, PositionKey, PositionSide};
+use crate::position::{FxRate, Lot, LotId, Mark, Position, PositionKey, PositionSide};
 use crate::types::{
     div_round, value_qty_price_multiplier, AccountingMethod, CurrencyId, EventId, Money, Price,
     Qty, RoundingMode,
 };
+use crate::valuation::{self, ValuationConfig};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FillAccountingConfig {
+    pub(crate) account_money_scale: u8,
+    pub(crate) rounding: RoundingMode,
+    pub(crate) allow_short: bool,
+    pub(crate) allow_position_flip: bool,
+    pub(crate) method: AccountingMethod,
+}
+
+#[derive(Debug)]
+pub(crate) struct FillAccountingInput<'a> {
+    pub(crate) fill: &'a Fill,
+    pub(crate) instrument: &'a InstrumentMeta,
+    pub(crate) account_currency: CurrencyId,
+    pub(crate) config: FillAccountingConfig,
+    pub(crate) valuation_config: ValuationConfig,
+    pub(crate) seq: u64,
+    pub(crate) event_id: EventId,
+    pub(crate) ts_unix_ns: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct FillAccountingState<'a> {
+    pub(crate) account: &'a mut AccountState,
+    pub(crate) positions: &'a mut BTreeMap<PositionKey, Position>,
+    pub(crate) lots: &'a mut BTreeMap<(PositionKey, LotId), Lot>,
+    pub(crate) marks: &'a BTreeMap<crate::types::InstrumentId, Mark>,
+    pub(crate) fx_rates: &'a BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FillAccountingOutcome {
+    pub(crate) key: PositionKey,
+    pub(crate) cash_delta: Money,
+    pub(crate) realized_delta: Money,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AverageCostConfig {
@@ -47,6 +87,159 @@ pub(crate) struct LotFillInput<'a> {
     pub(crate) ts_unix_ns: i64,
 }
 
+#[derive(Clone, Debug)]
+struct LotOpeningFillInput<'a> {
+    position: Option<Position>,
+    fill: &'a Fill,
+    instrument: &'a InstrumentMeta,
+    account_currency: CurrencyId,
+    config: LotAccountingConfig,
+    seq: u64,
+    event_id: EventId,
+    ts_unix_ns: i64,
+}
+
+pub(crate) fn apply_fill(
+    input: FillAccountingInput<'_>,
+    state: FillAccountingState<'_>,
+) -> Result<FillAccountingOutcome> {
+    let key = fill_position_key(input.fill);
+    let mut convert_money = |money, to_currency_id| {
+        valuation::convert_money(
+            money,
+            to_currency_id,
+            state.fx_rates,
+            input.valuation_config.clone(),
+        )
+    };
+
+    let (mut position, cash_delta, realized_delta) = match input.config.method {
+        AccountingMethod::AverageCost => {
+            let position = state.positions.remove(&key);
+            let outcome = apply_average_cost_fill(
+                AverageCostFillInput {
+                    position,
+                    fill: input.fill,
+                    instrument: input.instrument,
+                    account_currency: input.account_currency,
+                    config: AverageCostConfig {
+                        account_money_scale: input.config.account_money_scale,
+                        rounding: input.config.rounding,
+                        allow_short: input.config.allow_short,
+                        allow_position_flip: input.config.allow_position_flip,
+                    },
+                    ts_unix_ns: input.ts_unix_ns,
+                },
+                &mut convert_money,
+            )?;
+            (outcome.position, outcome.cash_delta, outcome.realized_delta)
+        }
+        AccountingMethod::Fifo | AccountingMethod::Lifo => {
+            let position = state.positions.remove(&key);
+            let qty = input.fill.qty.to_scale_exact(input.instrument.qty_scale)?;
+            if qty.value <= 0 {
+                return Err(Error::InvalidQuantity);
+            }
+            let signed_delta = qty
+                .value
+                .checked_mul(input.fill.side.sign())
+                .ok_or(Error::ArithmeticOverflow)?;
+            let old_qty = position
+                .as_ref()
+                .map(|position| position.signed_qty.value)
+                .unwrap_or(0);
+            if old_qty == 0 || old_qty.signum() == signed_delta.signum() {
+                let outcome = apply_lot_opening_fill(
+                    LotOpeningFillInput {
+                        position,
+                        fill: input.fill,
+                        instrument: input.instrument,
+                        account_currency: input.account_currency,
+                        config: LotAccountingConfig {
+                            account_money_scale: input.config.account_money_scale,
+                            rounding: input.config.rounding,
+                            allow_short: input.config.allow_short,
+                            allow_position_flip: input.config.allow_position_flip,
+                            method: input.config.method,
+                        },
+                        seq: input.seq,
+                        event_id: input.event_id,
+                        ts_unix_ns: input.ts_unix_ns,
+                    },
+                    qty,
+                    signed_delta,
+                    &mut convert_money,
+                )?;
+                state.lots.insert((key, outcome.lot.lot_id), outcome.lot);
+                (outcome.position, outcome.cash_delta, outcome.realized_delta)
+            } else {
+                let lots = lots_for_position(state.lots, key);
+                let outcome = apply_lot_fill(
+                    LotFillInput {
+                        position,
+                        lots,
+                        fill: input.fill,
+                        instrument: input.instrument,
+                        account_currency: input.account_currency,
+                        config: LotAccountingConfig {
+                            account_money_scale: input.config.account_money_scale,
+                            rounding: input.config.rounding,
+                            allow_short: input.config.allow_short,
+                            allow_position_flip: input.config.allow_position_flip,
+                            method: input.config.method,
+                        },
+                        seq: input.seq,
+                        event_id: input.event_id,
+                        ts_unix_ns: input.ts_unix_ns,
+                    },
+                    &mut convert_money,
+                )?;
+                remove_lots_for_position(state.lots, key);
+                for lot in outcome.lots {
+                    state.lots.insert((key, lot.lot_id), lot);
+                }
+                (outcome.position, outcome.cash_delta, outcome.realized_delta)
+            }
+        }
+    };
+
+    valuation::revalue_position(
+        &mut position,
+        input.instrument,
+        input.account_currency,
+        state.marks.get(&key.instrument_id),
+        state.fx_rates,
+        input.valuation_config,
+    )?;
+
+    state.account.cash = state.account.cash.checked_add(cash_delta)?;
+    state.account.trading_realized_pnl = state
+        .account
+        .trading_realized_pnl
+        .checked_add(realized_delta)?;
+    state.account.realized_pnl = state.account.realized_pnl.checked_add(realized_delta)?;
+    state.positions.insert(key, position);
+
+    Ok(FillAccountingOutcome {
+        key,
+        cash_delta,
+        realized_delta,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpeningLotInput {
+    key: PositionKey,
+    source_event_id: EventId,
+    leg_index: u8,
+    opened_seq: u64,
+    opened_at_unix_ns: i64,
+    qty: Qty,
+    entry_price: Price,
+    remaining_cost_basis: Money,
+    side_sign: i128,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AverageCostPositionFill {
     pub(crate) key: PositionKey,
@@ -77,6 +270,14 @@ pub(crate) struct LotFillOutcome {
     pub(crate) lots: Vec<Lot>,
     pub(crate) cash_delta: Money,
     pub(crate) realized_delta: Money,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LotOpeningFillOutcome {
+    position: Position,
+    lot: Lot,
+    cash_delta: Money,
+    realized_delta: Money,
 }
 
 pub(crate) fn apply_average_cost_fill(
@@ -128,6 +329,135 @@ pub(crate) fn fill_position_key(fill: &Fill) -> PositionKey {
         book_id: fill.book_id,
         instrument_id: fill.instrument_id,
     }
+}
+
+fn apply_lot_opening_fill(
+    input: LotOpeningFillInput<'_>,
+    qty: Qty,
+    signed_delta: i128,
+    mut convert_money: impl FnMut(Money, CurrencyId) -> Result<Money>,
+) -> Result<LotOpeningFillOutcome> {
+    let key = fill_position_key(input.fill);
+    let fee = convert_money(input.fill.fee, input.account_currency)?;
+    let price = input
+        .fill
+        .price
+        .to_scale(input.instrument.price_scale, input.config.rounding)?;
+    let zero = Money::zero(input.account_currency, input.config.account_money_scale);
+    let mut position = input.position.unwrap_or_else(|| Position {
+        key,
+        signed_qty: Qty::zero(qty.scale),
+        avg_price: None,
+        cost_basis: zero,
+        realized_pnl: zero,
+        unrealized_pnl: zero,
+        gross_exposure: zero,
+        net_exposure: zero,
+        opened_at_unix_ns: None,
+        updated_at_unix_ns: input.ts_unix_ns,
+    });
+    let old_qty = position.signed_qty.value;
+    let new_qty = old_qty
+        .checked_add(signed_delta)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if !input.config.allow_short && new_qty < 0 {
+        return Err(Error::ShortPositionNotAllowed);
+    }
+    if !input.config.allow_position_flip
+        && old_qty != 0
+        && old_qty.signum() != new_qty.signum()
+        && new_qty != 0
+    {
+        return Err(Error::PositionFlipNotAllowed);
+    }
+    if old_qty != 0 && old_qty.signum() != signed_delta.signum() {
+        return Err(Error::InvalidQuantity);
+    }
+
+    let trade_value = value_qty_price_multiplier(
+        signed_delta,
+        qty.scale,
+        price,
+        input.instrument.multiplier,
+        input.instrument.currency_id,
+        input.config.account_money_scale,
+        input.config.rounding,
+    )?;
+    let signed_trade_value = convert_money(trade_value, input.account_currency)?;
+    let cash_delta = signed_trade_value.checked_neg()?.checked_sub(fee)?;
+    let realized_delta = fee.checked_neg()?;
+
+    position.avg_price = Some(if old_qty == 0 {
+        price
+    } else {
+        weighted_avg_price(
+            old_qty.abs(),
+            position.avg_price.unwrap(),
+            qty.value,
+            price,
+            input.instrument.price_scale,
+            input.config.rounding,
+        )?
+    });
+    if old_qty == 0 {
+        position.opened_at_unix_ns = Some(input.ts_unix_ns);
+    }
+    position.signed_qty = Qty::new(new_qty, qty.scale);
+    position.cost_basis = position.cost_basis.checked_add(signed_trade_value)?;
+    position.realized_pnl = position.realized_pnl.checked_add(realized_delta)?;
+    position.updated_at_unix_ns = input.ts_unix_ns;
+
+    let lot = opening_lot(OpeningLotInput {
+        key,
+        source_event_id: input.event_id,
+        leg_index: 0,
+        opened_seq: input.seq,
+        opened_at_unix_ns: input.ts_unix_ns,
+        qty,
+        entry_price: price,
+        remaining_cost_basis: signed_trade_value,
+        side_sign: signed_delta.signum(),
+    })?;
+
+    Ok(LotOpeningFillOutcome {
+        position,
+        lot,
+        cash_delta,
+        realized_delta,
+    })
+}
+
+fn lots_for_position(lots: &BTreeMap<(PositionKey, LotId), Lot>, key: PositionKey) -> Vec<Lot> {
+    lots.range(lot_key_range(key))
+        .map(|(_, lot)| lot.clone())
+        .collect()
+}
+
+fn remove_lots_for_position(lots: &mut BTreeMap<(PositionKey, LotId), Lot>, key: PositionKey) {
+    let keys: Vec<_> = lots
+        .range(lot_key_range(key))
+        .map(|(lot_key, _)| *lot_key)
+        .collect();
+    for lot_key in keys {
+        lots.remove(&lot_key);
+    }
+}
+
+fn lot_key_range(key: PositionKey) -> std::ops::RangeInclusive<(PositionKey, LotId)> {
+    (
+        key,
+        LotId {
+            source_event_id: EventId(0),
+            leg_index: 0,
+        },
+    )
+        ..=(
+            key,
+            LotId {
+                source_event_id: EventId(u64::MAX),
+                leg_index: u8::MAX,
+            },
+        )
 }
 
 pub(crate) fn apply_lot_fill(
@@ -202,17 +532,17 @@ pub(crate) fn apply_lot_fill(
     let mut lots = input.lots;
 
     if old_qty == 0 || old_qty.signum() == signed_delta.signum() {
-        let opened = opening_lot(
+        let opened = opening_lot(OpeningLotInput {
             key,
-            input.event_id,
-            0,
-            input.seq,
-            input.ts_unix_ns,
+            source_event_id: input.event_id,
+            leg_index: 0,
+            opened_seq: input.seq,
+            opened_at_unix_ns: input.ts_unix_ns,
             qty,
-            price,
-            signed_trade_value,
-            signed_delta.signum(),
-        )?;
+            entry_price: price,
+            remaining_cost_basis: signed_trade_value,
+            side_sign: signed_delta.signum(),
+        })?;
         lots.push(opened);
     } else {
         let mut remaining_to_close = qty.value.min(old_qty.abs());
@@ -253,17 +583,17 @@ pub(crate) fn apply_lot_fill(
 
         if new_qty != 0 && old_qty.signum() != new_qty.signum() {
             let opening_basis = value_signed_qty_at_fill_price(new_qty)?;
-            lots.push(opening_lot(
+            lots.push(opening_lot(OpeningLotInput {
                 key,
-                input.event_id,
-                1,
-                input.seq,
-                input.ts_unix_ns,
-                Qty::new(new_qty.abs(), qty.scale),
-                price,
-                opening_basis,
-                new_qty.signum(),
-            )?);
+                source_event_id: input.event_id,
+                leg_index: 1,
+                opened_seq: input.seq,
+                opened_at_unix_ns: input.ts_unix_ns,
+                qty: Qty::new(new_qty.abs(), qty.scale),
+                entry_price: price,
+                remaining_cost_basis: opening_basis,
+                side_sign: new_qty.signum(),
+            })?);
         }
     }
 
@@ -286,17 +616,19 @@ pub(crate) fn apply_lot_fill(
     })
 }
 
-fn opening_lot(
-    key: PositionKey,
-    source_event_id: EventId,
-    leg_index: u8,
-    opened_seq: u64,
-    opened_at_unix_ns: i64,
-    qty: Qty,
-    entry_price: Price,
-    remaining_cost_basis: Money,
-    side_sign: i128,
-) -> Result<Lot> {
+fn opening_lot(input: OpeningLotInput) -> Result<Lot> {
+    let OpeningLotInput {
+        key,
+        source_event_id,
+        leg_index,
+        opened_seq,
+        opened_at_unix_ns,
+        qty,
+        entry_price,
+        remaining_cost_basis,
+        side_sign,
+    } = input;
+
     if qty.value <= 0 {
         return Err(Error::InvalidQuantity);
     }
@@ -634,12 +966,52 @@ mod tests {
         }
     }
 
+    fn account_state(cash: &str) -> AccountState {
+        let zero = money("0");
+        AccountState {
+            account_id: AccountId(1),
+            base_currency: CurrencyId::usd(),
+            initial_cash: money(cash),
+            cash: money(cash),
+            net_external_cash_flows: zero,
+            trading_realized_pnl: zero,
+            interest_pnl: zero,
+            borrow_pnl: zero,
+            funding_pnl: zero,
+            financing_pnl: zero,
+            total_financing_pnl: zero,
+            realized_pnl: zero,
+            peak_equity: zero,
+            current_drawdown: zero,
+            max_drawdown: zero,
+            initial_cash_set: true,
+        }
+    }
+
     fn config() -> AverageCostConfig {
         AverageCostConfig {
             account_money_scale: ACCOUNT_MONEY_SCALE,
             rounding: RoundingMode::HalfEven,
             allow_short: true,
             allow_position_flip: true,
+        }
+    }
+
+    fn fill_accounting_config(method: AccountingMethod) -> FillAccountingConfig {
+        FillAccountingConfig {
+            account_money_scale: ACCOUNT_MONEY_SCALE,
+            rounding: RoundingMode::HalfEven,
+            allow_short: true,
+            allow_position_flip: true,
+            method,
+        }
+    }
+
+    fn valuation_config() -> ValuationConfig {
+        ValuationConfig {
+            account_money_scale: ACCOUNT_MONEY_SCALE,
+            rounding_mode: RoundingMode::HalfEven,
+            fx_routing: crate::config::FxRoutingConfig::default(),
         }
     }
 
@@ -680,6 +1052,58 @@ mod tests {
     #[test]
     fn fill_position_key_matches_fill_identity() {
         assert_eq!(fill_position_key(&fill(Side::Buy, 1, "10.00", "0")), key());
+    }
+
+    #[test]
+    fn fill_accounting_lifecycle_updates_account_position_lots_and_valuation() {
+        let fill = fill(Side::Buy, 10, "10.00", "1.00");
+        let instrument = instrument();
+        let mut account = account_state("1000.00");
+        let mut positions = BTreeMap::new();
+        let mut lots = BTreeMap::new();
+        let mut marks = BTreeMap::new();
+        marks.insert(
+            InstrumentId(1),
+            Mark {
+                instrument_id: InstrumentId(1),
+                price: price("12.00"),
+                ts_unix_ns: 1,
+            },
+        );
+        let fx_rates = BTreeMap::new();
+
+        let outcome = apply_fill(
+            FillAccountingInput {
+                fill: &fill,
+                instrument: &instrument,
+                account_currency: CurrencyId::usd(),
+                config: fill_accounting_config(AccountingMethod::Fifo),
+                valuation_config: valuation_config(),
+                seq: 1,
+                event_id: EventId(1),
+                ts_unix_ns: 1,
+            },
+            FillAccountingState {
+                account: &mut account,
+                positions: &mut positions,
+                lots: &mut lots,
+                marks: &marks,
+                fx_rates: &fx_rates,
+            },
+        )
+        .unwrap();
+
+        let position = positions.get(&key()).unwrap();
+        assert_eq!(outcome.key, key());
+        assert_eq!(outcome.cash_delta, money("-101.00"));
+        assert_eq!(outcome.realized_delta, money("-1.00"));
+        assert_eq!(account.cash, money("899.00"));
+        assert_eq!(account.trading_realized_pnl, money("-1.00"));
+        assert_eq!(account.realized_pnl, money("-1.00"));
+        assert_eq!(position.cost_basis, money("100.00"));
+        assert_eq!(position.net_exposure, money("120.00"));
+        assert_eq!(position.unrealized_pnl, money("20.00"));
+        assert_eq!(lots.len(), 1);
     }
 
     #[test]

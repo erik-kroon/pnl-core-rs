@@ -70,6 +70,7 @@ mod tests {
             accounts: Vec::new(),
             books: Vec::new(),
             instruments: Vec::new(),
+            instrument_lifecycles: Vec::new(),
             positions: Vec::new(),
             lots: Vec::new(),
             marks: Vec::new(),

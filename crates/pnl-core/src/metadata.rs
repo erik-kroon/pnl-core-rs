@@ -29,3 +29,16 @@ pub struct InstrumentMeta {
     pub qty_scale: u8,
     pub multiplier: FixedI128,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstrumentLifecycleState {
+    Active,
+    Halted,
+    Delisted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentLifecycleMeta {
+    pub instrument_id: InstrumentId,
+    pub state: InstrumentLifecycleState,
+}
