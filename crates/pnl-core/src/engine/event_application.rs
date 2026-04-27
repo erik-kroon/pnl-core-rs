@@ -20,6 +20,7 @@ pub(crate) struct AccountingEffect {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccountingStateChanges {
+    pub(crate) changed_accounts: Vec<AccountId>,
     pub(crate) changed_positions: Vec<PositionKey>,
     pub(crate) cash_delta: Money,
     pub(crate) realized_pnl_delta: Money,
@@ -34,6 +35,7 @@ impl AccountingEffect {
     fn new(zero: Money) -> Self {
         Self {
             state: AccountingStateChanges {
+                changed_accounts: Vec::new(),
                 changed_positions: Vec::new(),
                 cash_delta: zero,
                 realized_pnl_delta: zero,
@@ -48,6 +50,12 @@ impl AccountingEffect {
         self.state.changed_positions.push(key);
     }
 
+    fn record_changed_account(&mut self, account_id: AccountId) {
+        if !self.state.changed_accounts.contains(&account_id) {
+            self.state.changed_accounts.push(account_id);
+        }
+    }
+
     fn record_cash_delta(&mut self, delta: Money) {
         self.state.cash_delta = delta;
     }
@@ -57,6 +65,7 @@ impl AccountingEffect {
     }
 
     fn require_drawdown_update(&mut self, account_id: AccountId) {
+        self.record_changed_account(account_id);
         self.follow_up.drawdown_accounts.insert(account_id);
     }
 
@@ -67,6 +76,7 @@ impl AccountingEffect {
     pub(crate) fn into_apply_receipt(self, sequence: u64) -> ApplyReceipt {
         ApplyReceipt {
             sequence,
+            changed_accounts: self.state.changed_accounts,
             changed_positions: self.state.changed_positions,
             realized_pnl_delta: self.state.realized_pnl_delta,
             cash_delta: self.state.cash_delta,

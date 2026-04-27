@@ -10,10 +10,12 @@ use crate::position::{FxRate, Lot, LotId, Mark, Position, PositionKey};
 use crate::registry::Registry;
 use crate::replay_journal::ReplayJournal;
 use crate::state_hash::{hash_engine_state, StateHash};
-use crate::summary::{AccountSummary, ApplyReceipt, ReplayReport};
+use crate::summary::{
+    AccountReconciliation, AccountSummary, ApplyReceipt, ExplainedApplyReceipt, ReplayReport,
+};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) mod event_application;
 
@@ -151,12 +153,47 @@ impl Engine {
         crate::replay_journal::apply_event(self, event)
     }
 
+    pub fn apply_explained(&mut self, event: Event) -> Result<ExplainedApplyReceipt> {
+        let before = self.clone();
+        let receipt = self.apply(event)?;
+        let mut account_ids = BTreeSet::new();
+        account_ids.extend(receipt.changed_accounts.iter().copied());
+        account_ids.extend(
+            receipt
+                .changed_positions
+                .iter()
+                .map(|position| position.account_id),
+        );
+
+        let mut account_changes = Vec::new();
+        for account_id in account_ids {
+            let before_metrics = AccountMetrics::compute(&before, account_id)?;
+            let after_metrics = AccountMetrics::compute(self, account_id)?;
+            account_changes.push(AccountMetrics::explain_change(
+                before_metrics,
+                after_metrics,
+            )?);
+        }
+
+        Ok(ExplainedApplyReceipt {
+            receipt,
+            account_changes,
+        })
+    }
+
     pub fn position(&self, key: PositionKey) -> Option<&Position> {
         self.positions.get(&key)
     }
 
     pub fn account_summary(&self, account_id: AccountId) -> Result<AccountSummary> {
         Ok(AccountMetrics::compute(self, account_id)?.into_summary(self.state_hash()))
+    }
+
+    pub fn account_reconciliation(&self, account_id: AccountId) -> Result<AccountReconciliation> {
+        self.registry.ensure_account(account_id)?;
+        let initial_cash = self.accounts.get(&account_id).unwrap().initial_cash;
+        Ok(AccountMetrics::compute(self, account_id)?
+            .into_reconciliation(initial_cash, self.state_hash()))
     }
 
     pub fn state_hash(&self) -> StateHash {
