@@ -10,7 +10,7 @@ public state can be snapshotted, restored, and hashed deterministically.
 
 ## Status
 
-This repository contains the V2 Rust implementation:
+This repository is a pre-0.1.0 Rust implementation under active development:
 
 - `crates/pnl-core`: accounting engine and public Rust interface.
 - `crates/pnl-cli`: replay CLI for TOML, CSV, and NDJSON inputs.
@@ -22,7 +22,7 @@ or settlement engine.
 See [ROADMAP.md](ROADMAP.md) for planned hardening and future accounting model
 candidates.
 
-## What V2 Supports
+## Current Capabilities
 
 - Strict contiguous event replay.
 - Typed IDs for accounts, books, instruments, currencies, and events.
@@ -36,6 +36,7 @@ candidates.
 - Marks, FX revaluation, gross/net exposure, unrealized PnL, and leverage.
 - Split, symbol change, and instrument lifecycle events.
 - Trade corrections and busts through deterministic historical replay.
+- Structured apply explanations and account reconciliation reports.
 - Versioned binary `.pnlsnap` snapshot/restore.
 - JSON snapshot export for inspection and golden tests.
 - Deterministic `state_hash()` over canonical accounting state.
@@ -144,12 +145,18 @@ assert_eq!(report.state_hash, engine.state_hash());
 
 let summary = engine.account_summary(AccountId(1))?;
 println!("{summary:?}");
+
+let reconciliation = engine.account_reconciliation(AccountId(1))?;
+assert_eq!(reconciliation.pnl_reconciliation_delta.amount, 0);
 # Ok::<(), pnl_core::Error>(())
 ```
 
-`apply` returns a lightweight per-event receipt. `apply_many` is the preferred
-bulk replay API and computes one final deterministic state hash for the replay
-report.
+`apply` returns a lightweight per-event receipt with changed accounts, changed
+positions, and aggregate cash/PnL deltas. Use `apply_explained` when callers
+need a structured before/after explanation of why cash, market value, equity,
+realized PnL, unrealized PnL, total PnL, or reconciliation changed for affected
+accounts. `apply_many` is the preferred bulk replay API and computes one final
+deterministic state hash for the replay report.
 
 For a service-style embedding example with ingestion, summary reads, snapshot
 write, and restore, see
@@ -157,7 +164,7 @@ write, and restore, see
 
 ## Accounting Model
 
-V2 supports engine-wide average-cost, FIFO, and LIFO accounting. Fees are
+The engine supports engine-wide average-cost, FIFO, and LIFO accounting. Fees are
 converted into account currency before cash and realized PnL updates. Positive
 fees are costs; negative fees are rebates. Fees reduce or increase cash
 immediately and are recognized immediately in realized PnL. Fees are not
@@ -185,7 +192,7 @@ Events must be pre-ordered by `seq`.
 - Each next event must use `last_seq + 1`.
 - `event_id` must be unique.
 - The CLI defaults `event_id` to `seq` when omitted.
-- `ts_unix_ns` is recorded but informational in V2.
+- `ts_unix_ns` is recorded but informational in the current engine.
 
 Supported event types:
 
@@ -347,8 +354,8 @@ The codebase is split around the main accounting seams:
 - No settlement model.
 - No dividends.
 - No broker connectors, order management, or strategy logic.
-- No Python, C, or WASM bindings in V2.
-- No Arrow or Parquet export in V2.
+- No Python, C, or WASM bindings yet.
+- No Arrow or Parquet export yet.
 
 ## Validation
 
@@ -369,8 +376,6 @@ read/write time. Baseline notes and acceptance targets live in
 
 ## Roadmap
 
-- FIFO/LIFO accounting.
-- Explain APIs and reconciliation reports.
 - Python bindings.
 - C ABI.
 - WASM package.

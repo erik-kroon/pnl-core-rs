@@ -1,8 +1,9 @@
 # Roadmap
 
-`pnl-core-rs` is currently a V2 deterministic accounting engine for ordered
-event replay, fixed-point PnL, lot accounting, snapshots, and state hashes. The
-roadmap below is organized by product maturity rather than calendar dates.
+`pnl-core-rs` is currently a pre-0.1.0 deterministic accounting engine for
+ordered event replay, fixed-point PnL, lot accounting, snapshots, and state
+hashes. The roadmap below is organized by product maturity rather than calendar
+dates.
 
 ## Guiding Constraints
 
@@ -14,38 +15,38 @@ roadmap below is organized by product maturity rather than calendar dates.
 - Maintain stable snapshot compatibility or provide explicit migration paths
   when compatibility cannot be preserved.
 
-## Completed V1 Hardening
+## Completed Foundation
 
-- Expand golden tests for binary snapshots, JSON snapshots, and state hashes.
-- Add more property tests around position flips, partial closes, fees, rebates,
-  and cash-flow reconciliation.
-- Improve malformed CLI input diagnostics with row, line, and field context.
-- Add regression fixtures for multi-account and multi-book replay.
-- Document the accepted event journal and correction/bust replay model in more
-  implementation detail.
-- Define minimum supported Rust version and CI coverage expectations.
+- Deterministic fixed-point accounting with strict ordered replay.
+- Binary snapshots, JSON snapshot export, and deterministic state hashes.
+- Golden tests for representative snapshot and state hash outputs.
+- Property tests around position flips, partial closes, fees, rebates, and
+  cash-flow reconciliation.
+- Malformed CLI input diagnostics with row, line, and field context.
+- Regression fixtures for multi-account and multi-book replay.
+- Documented event journal and correction/bust replay model.
+- Minimum supported Rust version and CI command expectations.
 
-## Completed V1.1 Operational Readiness
+## Completed Operational Readiness
 
-- Add configurable output formats for the CLI, including machine-readable JSON
-  summaries.
-- Support replay resume from an existing `.pnlsnap` plus later event files.
-- Add snapshot metadata fields for producer, build version, fixture identifier,
-  and optional user notes.
-- Add benchmark baselines for replay throughput, correction replay cost, and
+- Configurable CLI output formats, including machine-readable JSON summaries.
+- Replay resume from an existing `.pnlsnap` plus later event files.
+- Snapshot metadata fields for producer, build version, fixture identifier, and
+  optional user notes.
+- Benchmark baselines for replay throughput, correction replay cost, and
   snapshot read/write performance.
-- Publish crate-level examples for embedding the engine in a service.
+- Crate-level example for embedding the engine in a service.
+- Structured apply explanations and account reconciliation reports for callers
+  that need to inspect cash, equity, and PnL movement.
 
-## V2 Lot Accounting
+## Completed Accounting Model Work
 
-- Lot-based accounting alongside average cost, with explicit engine-wide method
-  selection.
-- FIFO/LIFO realized PnL policies for downstream reporting.
-- Public open-lot inspection.
+- Engine-wide average-cost, FIFO, and LIFO accounting.
+- Public open-lot inspection for FIFO/LIFO accounting.
 - Opt-in inverse FX lookup and configured one-pivot cross-rate routing.
-- Corporate-action-style adjustment events for splits and symbol/instrument
+- Corporate-action-style events for splits, symbol changes, and instrument
   lifecycle changes.
-- Snapshot format version `2` with lot state in the canonical hash material.
+- Lot state included in the current canonical snapshot/hash material.
 
 ## Future Accounting Model Candidates
 
@@ -62,6 +63,9 @@ roadmap below is organized by product maturity rather than calendar dates.
 - Optional no-std evaluation for the fixed-point/accounting core if dependency
   shape allows it.
 - WASM-compatible build target for browser or edge replay use cases.
+- Python bindings.
+- C ABI.
+- Arrow/Parquet export.
 - FFI boundary evaluation only after the Rust API stabilizes.
 
 ## Out Of Scope

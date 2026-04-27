@@ -209,6 +209,7 @@ fn apply_history_rewrite(engine: &mut Engine, event: Event) -> Result<ApplyRecei
 
     Ok(ApplyReceipt {
         sequence,
+        changed_accounts: vec![target.account_id],
         changed_positions: vec![target.position_key],
         realized_pnl_delta: realized_delta,
         cash_delta,

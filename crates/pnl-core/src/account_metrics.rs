@@ -1,7 +1,7 @@
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::state_hash::StateHash;
-use crate::summary::AccountSummary;
+use crate::summary::{AccountChangeExplanation, AccountReconciliation, AccountSummary};
 use crate::types::*;
 use crate::valuation;
 
@@ -29,6 +29,7 @@ pub(crate) struct AccountMetrics {
     max_drawdown: Money,
     open_positions: u32,
     net_external_cash_flows: Money,
+    expected_pnl_from_equity: Money,
     pnl_reconciliation_delta: Money,
 }
 
@@ -57,10 +58,10 @@ impl AccountMetrics {
         } else {
             None
         };
-        let expected_pnl = equity
+        let expected_pnl_from_equity = equity
             .checked_sub(account.initial_cash)?
             .checked_sub(account.net_external_cash_flows)?;
-        let pnl_reconciliation_delta = expected_pnl.checked_sub(total_pnl)?;
+        let pnl_reconciliation_delta = expected_pnl_from_equity.checked_sub(total_pnl)?;
 
         Ok(Self {
             account_id,
@@ -85,6 +86,7 @@ impl AccountMetrics {
             max_drawdown: account.max_drawdown,
             open_positions: totals.open_positions,
             net_external_cash_flows: account.net_external_cash_flows,
+            expected_pnl_from_equity,
             pnl_reconciliation_delta,
         })
     }
@@ -120,6 +122,65 @@ impl AccountMetrics {
             pnl_reconciliation_delta: self.pnl_reconciliation_delta,
             state_hash,
         }
+    }
+
+    pub(crate) fn into_reconciliation(
+        self,
+        initial_cash: Money,
+        state_hash: StateHash,
+    ) -> AccountReconciliation {
+        AccountReconciliation {
+            account_id: self.account_id,
+            base_currency: self.base_currency,
+            initial_cash,
+            cash: self.cash,
+            net_external_cash_flows: self.net_external_cash_flows,
+            position_market_value: self.position_market_value,
+            equity: self.equity,
+            realized_pnl: self.realized_pnl,
+            unrealized_pnl: self.unrealized_pnl,
+            total_pnl: self.total_pnl,
+            expected_pnl_from_equity: self.expected_pnl_from_equity,
+            pnl_reconciliation_delta: self.pnl_reconciliation_delta,
+            state_hash,
+        }
+    }
+
+    pub(crate) fn explain_change(before: Self, after: Self) -> Result<AccountChangeExplanation> {
+        Ok(AccountChangeExplanation {
+            account_id: after.account_id,
+            base_currency: after.base_currency,
+            before_cash: before.cash,
+            after_cash: after.cash,
+            cash_delta: after.cash.checked_sub(before.cash)?,
+            before_position_market_value: before.position_market_value,
+            after_position_market_value: after.position_market_value,
+            position_market_value_delta: after
+                .position_market_value
+                .checked_sub(before.position_market_value)?,
+            before_equity: before.equity,
+            after_equity: after.equity,
+            equity_delta: after.equity.checked_sub(before.equity)?,
+            before_realized_pnl: before.realized_pnl,
+            after_realized_pnl: after.realized_pnl,
+            realized_pnl_delta: after.realized_pnl.checked_sub(before.realized_pnl)?,
+            before_unrealized_pnl: before.unrealized_pnl,
+            after_unrealized_pnl: after.unrealized_pnl,
+            unrealized_pnl_delta: after.unrealized_pnl.checked_sub(before.unrealized_pnl)?,
+            before_total_pnl: before.total_pnl,
+            after_total_pnl: after.total_pnl,
+            total_pnl_delta: after.total_pnl.checked_sub(before.total_pnl)?,
+            before_net_external_cash_flows: before.net_external_cash_flows,
+            after_net_external_cash_flows: after.net_external_cash_flows,
+            net_external_cash_flows_delta: after
+                .net_external_cash_flows
+                .checked_sub(before.net_external_cash_flows)?,
+            before_pnl_reconciliation_delta: before.pnl_reconciliation_delta,
+            after_pnl_reconciliation_delta: after.pnl_reconciliation_delta,
+            pnl_reconciliation_delta_change: after
+                .pnl_reconciliation_delta
+                .checked_sub(before.pnl_reconciliation_delta)?,
+        })
     }
 }
 
@@ -229,5 +290,55 @@ mod tests {
             summary.current_drawdown,
             summary.equity.checked_sub(summary.peak_equity).unwrap()
         );
+    }
+
+    #[test]
+    fn account_reconciliation_exposes_equity_pnl_formula() {
+        let mut engine = setup();
+        engine.apply(initial(1, "10000.00")).unwrap();
+        engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+        engine.apply(mark(3, "12.00")).unwrap();
+
+        let reconciliation = engine.account_reconciliation(AccountId(1)).unwrap();
+
+        assert_eq!(reconciliation.initial_cash, money("10000.00"));
+        assert_eq!(reconciliation.cash, money("9000.00"));
+        assert_eq!(reconciliation.position_market_value, money("1200.00"));
+        assert_eq!(reconciliation.equity, money("10200.00"));
+        assert_eq!(reconciliation.realized_pnl, money("0.00"));
+        assert_eq!(reconciliation.unrealized_pnl, money("200.00"));
+        assert_eq!(reconciliation.total_pnl, money("200.00"));
+        assert_eq!(reconciliation.expected_pnl_from_equity, money("200.00"));
+        assert_eq!(reconciliation.pnl_reconciliation_delta, money("0.00"));
+    }
+
+    #[test]
+    fn apply_explained_reports_cash_equity_and_pnl_changes() {
+        let mut engine = setup();
+        let initial = engine.apply_explained(initial(1, "10000.00")).unwrap();
+
+        assert_eq!(initial.receipt.changed_accounts, vec![AccountId(1)]);
+        assert!(initial.receipt.changed_positions.is_empty());
+        assert_eq!(initial.account_changes.len(), 1);
+        assert_eq!(initial.account_changes[0].cash_delta, money("10000.00"));
+        assert_eq!(initial.account_changes[0].equity_delta, money("10000.00"));
+        assert_eq!(initial.account_changes[0].total_pnl_delta, money("0.00"));
+
+        engine
+            .apply_explained(fill(2, Side::Buy, 100, "10.00", "0"))
+            .unwrap();
+        let mark = engine.apply_explained(mark(3, "12.00")).unwrap();
+
+        assert_eq!(mark.receipt.changed_accounts, vec![AccountId(1)]);
+        assert_eq!(mark.receipt.changed_positions.len(), 1);
+        assert_eq!(mark.account_changes.len(), 1);
+        let change = &mark.account_changes[0];
+        assert_eq!(change.cash_delta, money("0.00"));
+        assert_eq!(change.position_market_value_delta, money("200.00"));
+        assert_eq!(change.equity_delta, money("200.00"));
+        assert_eq!(change.realized_pnl_delta, money("0.00"));
+        assert_eq!(change.unrealized_pnl_delta, money("200.00"));
+        assert_eq!(change.total_pnl_delta, money("200.00"));
+        assert_eq!(change.after_pnl_reconciliation_delta, money("0.00"));
     }
 }
