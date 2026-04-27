@@ -1,14 +1,14 @@
-use super::SnapshotV1;
+use super::SnapshotV2;
 use crate::error::{Error, Result};
 use std::io::{Read, Write};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"PNLRS001";
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION: u16 = 2;
 const SNAPSHOT_CODEC_POSTCARD: u8 = 1;
 const SNAPSHOT_COMPRESSION_NONE: u8 = 0;
 const HEADER_LEN: usize = 56;
 
-pub(super) fn write_snapshot<W: Write>(snapshot: &SnapshotV1, mut writer: W) -> Result<()> {
+pub(super) fn write_snapshot<W: Write>(snapshot: &SnapshotV2, mut writer: W) -> Result<()> {
     let payload = postcard::to_allocvec(snapshot)?;
     let payload_hash = *blake3::hash(&payload).as_bytes();
     let mut header = Vec::with_capacity(HEADER_LEN);
@@ -25,7 +25,7 @@ pub(super) fn write_snapshot<W: Write>(snapshot: &SnapshotV1, mut writer: W) -> 
     Ok(())
 }
 
-pub(super) fn read_snapshot<R: Read>(mut reader: R) -> Result<SnapshotV1> {
+pub(super) fn read_snapshot<R: Read>(mut reader: R) -> Result<SnapshotV2> {
     let mut header = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header)?;
     if &header[0..8] != SNAPSHOT_MAGIC {
@@ -60,17 +60,18 @@ pub(super) fn read_snapshot<R: Read>(mut reader: R) -> Result<SnapshotV1> {
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
-    use crate::snapshot::SnapshotMetadataV1;
-    use crate::state_hash::{hash_canonical_state, CanonicalStateV1};
+    use crate::snapshot::SnapshotMetadataV2;
+    use crate::state_hash::{hash_canonical_state, CanonicalStateV2};
 
-    fn minimal_snapshot() -> SnapshotV1 {
-        let state = CanonicalStateV1 {
+    fn minimal_snapshot() -> SnapshotV2 {
+        let state = CanonicalStateV2 {
             config: EngineConfig::default(),
             currencies: Vec::new(),
             accounts: Vec::new(),
             books: Vec::new(),
             instruments: Vec::new(),
             positions: Vec::new(),
+            lots: Vec::new(),
             marks: Vec::new(),
             fx_rates: Vec::new(),
             seen_events: Vec::new(),
@@ -78,18 +79,21 @@ mod tests {
             last_seq: 0,
         };
         let state_hash = hash_canonical_state(&state);
-        SnapshotV1 {
-            metadata: SnapshotMetadataV1 {
-                snapshot_sequence: 0,
+        SnapshotV2 {
+            metadata: SnapshotMetadataV2 {
                 last_applied_event_seq: 0,
                 state_hash,
+                producer: "test".to_string(),
+                build_version: "0.0.0".to_string(),
+                fixture_identifier: Some("minimal".to_string()),
+                user_notes: None,
             },
             state,
         }
     }
 
     #[test]
-    fn writes_v1_header_and_payload_hash() {
+    fn writes_v2_header_and_payload_hash() {
         let snapshot = minimal_snapshot();
         let mut bytes = Vec::new();
         write_snapshot(&snapshot, &mut bytes).unwrap();
@@ -114,11 +118,11 @@ mod tests {
         let snapshot = minimal_snapshot();
         let mut bytes = Vec::new();
         write_snapshot(&snapshot, &mut bytes).unwrap();
-        bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
 
         assert_eq!(
             read_snapshot(bytes.as_slice()),
-            Err(Error::SnapshotVersionUnsupported(2))
+            Err(Error::SnapshotVersionUnsupported(1))
         );
     }
 }

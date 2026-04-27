@@ -1,9 +1,10 @@
 use crate::error::{Error, Result};
 use crate::event::Fill;
 use crate::metadata::InstrumentMeta;
-use crate::position::{Position, PositionKey};
+use crate::position::{Lot, LotId, Position, PositionKey, PositionSide};
 use crate::types::{
-    div_round, value_qty_price_multiplier, CurrencyId, Money, Price, Qty, RoundingMode,
+    div_round, value_qty_price_multiplier, AccountingMethod, CurrencyId, EventId, Money, Price,
+    Qty, RoundingMode,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +22,28 @@ pub(crate) struct AverageCostFillInput<'a> {
     pub(crate) instrument: &'a InstrumentMeta,
     pub(crate) account_currency: CurrencyId,
     pub(crate) config: AverageCostConfig,
+    pub(crate) ts_unix_ns: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LotAccountingConfig {
+    pub(crate) account_money_scale: u8,
+    pub(crate) rounding: RoundingMode,
+    pub(crate) allow_short: bool,
+    pub(crate) allow_position_flip: bool,
+    pub(crate) method: AccountingMethod,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LotFillInput<'a> {
+    pub(crate) position: Option<Position>,
+    pub(crate) lots: Vec<Lot>,
+    pub(crate) fill: &'a Fill,
+    pub(crate) instrument: &'a InstrumentMeta,
+    pub(crate) account_currency: CurrencyId,
+    pub(crate) config: LotAccountingConfig,
+    pub(crate) seq: u64,
+    pub(crate) event_id: EventId,
     pub(crate) ts_unix_ns: i64,
 }
 
@@ -43,6 +66,15 @@ struct AverageCostPositionFill {
 pub(crate) struct AverageCostFillOutcome {
     pub(crate) key: PositionKey,
     pub(crate) position: Position,
+    pub(crate) cash_delta: Money,
+    pub(crate) realized_delta: Money,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LotFillOutcome {
+    pub(crate) key: PositionKey,
+    pub(crate) position: Position,
+    pub(crate) lots: Vec<Lot>,
     pub(crate) cash_delta: Money,
     pub(crate) realized_delta: Money,
 }
@@ -96,6 +128,295 @@ pub(crate) fn fill_position_key(fill: &Fill) -> PositionKey {
         book_id: fill.book_id,
         instrument_id: fill.instrument_id,
     }
+}
+
+pub(crate) fn apply_lot_fill(
+    input: LotFillInput<'_>,
+    mut convert_money: impl FnMut(Money, CurrencyId) -> Result<Money>,
+) -> Result<LotFillOutcome> {
+    if !matches!(
+        input.config.method,
+        AccountingMethod::Fifo | AccountingMethod::Lifo
+    ) {
+        return Err(Error::UnsupportedEventType("lot accounting method"));
+    }
+
+    let fee = convert_money(input.fill.fee, input.account_currency)?;
+    let qty = input.fill.qty.to_scale_exact(input.instrument.qty_scale)?;
+    if qty.value <= 0 {
+        return Err(Error::InvalidQuantity);
+    }
+    let price = input
+        .fill
+        .price
+        .to_scale(input.instrument.price_scale, input.config.rounding)?;
+    let signed_delta = qty
+        .value
+        .checked_mul(input.fill.side.sign())
+        .ok_or(Error::ArithmeticOverflow)?;
+    let key = fill_position_key(input.fill);
+    let zero = Money::zero(input.account_currency, input.config.account_money_scale);
+    let mut position = input.position.unwrap_or_else(|| Position {
+        key,
+        signed_qty: Qty::zero(qty.scale),
+        avg_price: None,
+        cost_basis: zero,
+        realized_pnl: zero,
+        unrealized_pnl: zero,
+        gross_exposure: zero,
+        net_exposure: zero,
+        opened_at_unix_ns: None,
+        updated_at_unix_ns: input.ts_unix_ns,
+    });
+    let old_qty = position.signed_qty.value;
+    let new_qty = old_qty
+        .checked_add(signed_delta)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if !input.config.allow_short && new_qty < 0 {
+        return Err(Error::ShortPositionNotAllowed);
+    }
+    if !input.config.allow_position_flip
+        && old_qty != 0
+        && old_qty.signum() != new_qty.signum()
+        && new_qty != 0
+    {
+        return Err(Error::PositionFlipNotAllowed);
+    }
+
+    let mut value_signed_qty_at_fill_price = |signed_qty| {
+        let trade_value = value_qty_price_multiplier(
+            signed_qty,
+            qty.scale,
+            price,
+            input.instrument.multiplier,
+            input.instrument.currency_id,
+            input.config.account_money_scale,
+            input.config.rounding,
+        )?;
+        convert_money(trade_value, input.account_currency)
+    };
+
+    let signed_trade_value = value_signed_qty_at_fill_price(signed_delta)?;
+    let cash_delta = signed_trade_value.checked_neg()?.checked_sub(fee)?;
+    let mut realized_delta = fee.checked_neg()?;
+    let mut lots = input.lots;
+
+    if old_qty == 0 || old_qty.signum() == signed_delta.signum() {
+        let opened = opening_lot(
+            key,
+            input.event_id,
+            0,
+            input.seq,
+            input.ts_unix_ns,
+            qty,
+            price,
+            signed_trade_value,
+            signed_delta.signum(),
+        )?;
+        lots.push(opened);
+    } else {
+        let mut remaining_to_close = qty.value.min(old_qty.abs());
+        sort_lots_for_close(&mut lots, input.config.method);
+        for lot in &mut lots {
+            if remaining_to_close == 0 {
+                break;
+            }
+            if lot.side.sign() != old_qty.signum() || lot.remaining_qty.value == 0 {
+                continue;
+            }
+            let close_qty = remaining_to_close.min(lot.remaining_qty.value);
+            let closed_basis = close_lot_basis(lot, close_qty, input.config.rounding)?;
+            let closing_signed_qty = close_qty
+                .checked_mul(signed_delta.signum())
+                .ok_or(Error::ArithmeticOverflow)?;
+            let closing_trade_value = value_signed_qty_at_fill_price(closing_signed_qty)?;
+            let realized = closing_trade_value
+                .checked_neg()?
+                .checked_sub(closed_basis)?;
+            realized_delta = realized_delta.checked_add(realized)?;
+            lot.remaining_qty = Qty::new(
+                lot.remaining_qty
+                    .value
+                    .checked_sub(close_qty)
+                    .ok_or(Error::ArithmeticOverflow)?,
+                lot.remaining_qty.scale,
+            );
+            lot.remaining_cost_basis = lot.remaining_cost_basis.checked_sub(closed_basis)?;
+            remaining_to_close = remaining_to_close
+                .checked_sub(close_qty)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if remaining_to_close != 0 {
+            return Err(Error::InvalidQuantity);
+        }
+        lots.retain(|lot| lot.remaining_qty.value != 0);
+
+        if new_qty != 0 && old_qty.signum() != new_qty.signum() {
+            let opening_basis = value_signed_qty_at_fill_price(new_qty)?;
+            lots.push(opening_lot(
+                key,
+                input.event_id,
+                1,
+                input.seq,
+                input.ts_unix_ns,
+                Qty::new(new_qty.abs(), qty.scale),
+                price,
+                opening_basis,
+                new_qty.signum(),
+            )?);
+        }
+    }
+
+    rebuild_position_from_lots(
+        &mut position,
+        key,
+        lots.as_slice(),
+        realized_delta,
+        input.config.account_money_scale,
+        input.config.rounding,
+        input.ts_unix_ns,
+    )?;
+
+    Ok(LotFillOutcome {
+        key,
+        position,
+        lots,
+        cash_delta,
+        realized_delta,
+    })
+}
+
+fn opening_lot(
+    key: PositionKey,
+    source_event_id: EventId,
+    leg_index: u8,
+    opened_seq: u64,
+    opened_at_unix_ns: i64,
+    qty: Qty,
+    entry_price: Price,
+    remaining_cost_basis: Money,
+    side_sign: i128,
+) -> Result<Lot> {
+    if qty.value <= 0 {
+        return Err(Error::InvalidQuantity);
+    }
+    let side = match side_sign {
+        1 => PositionSide::Long,
+        -1 => PositionSide::Short,
+        _ => return Err(Error::InvalidQuantity),
+    };
+    Ok(Lot {
+        lot_id: LotId {
+            source_event_id,
+            leg_index,
+        },
+        account_id: key.account_id,
+        book_id: key.book_id,
+        instrument_id: key.instrument_id,
+        side,
+        original_qty: qty,
+        remaining_qty: qty,
+        entry_price,
+        remaining_cost_basis,
+        opened_event_id: source_event_id,
+        opened_seq,
+        opened_at_unix_ns,
+    })
+}
+
+fn sort_lots_for_close(lots: &mut [Lot], method: AccountingMethod) {
+    lots.sort_by_key(|lot| (lot.opened_seq, lot.opened_event_id, lot.lot_id.leg_index));
+    if method == AccountingMethod::Lifo {
+        lots.reverse();
+    }
+}
+
+fn close_lot_basis(lot: &Lot, close_qty: i128, rounding: RoundingMode) -> Result<Money> {
+    if close_qty == lot.remaining_qty.value {
+        return Ok(lot.remaining_cost_basis);
+    }
+    let amount = div_round(
+        lot.remaining_cost_basis
+            .amount
+            .checked_mul(close_qty)
+            .ok_or(Error::ArithmeticOverflow)?,
+        lot.remaining_qty.value,
+        rounding,
+    )?;
+    Ok(Money::new(
+        amount,
+        lot.remaining_cost_basis.scale,
+        lot.remaining_cost_basis.currency_id,
+    ))
+}
+
+fn rebuild_position_from_lots(
+    position: &mut Position,
+    key: PositionKey,
+    lots: &[Lot],
+    realized_delta: Money,
+    account_money_scale: u8,
+    rounding: RoundingMode,
+    ts_unix_ns: i64,
+) -> Result<()> {
+    let account_currency = realized_delta.currency_id;
+    let zero = Money::zero(account_currency, account_money_scale);
+    let mut signed_qty_value = 0_i128;
+    let mut cost_basis = zero;
+    let mut opened_at_unix_ns: Option<i64> = None;
+    let mut total_abs_qty = 0_i128;
+    let mut weighted_price_value = 0_i128;
+    let mut price_scale = None;
+    let qty_scale = lots
+        .first()
+        .map(|lot| lot.remaining_qty.scale)
+        .unwrap_or(position.signed_qty.scale);
+
+    for lot in lots {
+        signed_qty_value = signed_qty_value
+            .checked_add(
+                lot.remaining_qty
+                    .value
+                    .checked_mul(lot.side.sign())
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        cost_basis = cost_basis.checked_add(lot.remaining_cost_basis)?;
+        opened_at_unix_ns = Some(match opened_at_unix_ns {
+            Some(current) => current.min(lot.opened_at_unix_ns),
+            None => lot.opened_at_unix_ns,
+        });
+        let target_price_scale = price_scale.unwrap_or(lot.entry_price.scale);
+        let entry_price = lot.entry_price.to_scale(target_price_scale, rounding)?;
+        price_scale = Some(target_price_scale);
+        total_abs_qty = total_abs_qty
+            .checked_add(lot.remaining_qty.value)
+            .ok_or(Error::ArithmeticOverflow)?;
+        weighted_price_value = weighted_price_value
+            .checked_add(
+                lot.remaining_qty
+                    .value
+                    .checked_mul(entry_price.value)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+    }
+
+    position.key = key;
+    position.signed_qty = Qty::new(signed_qty_value, qty_scale);
+    position.avg_price = if total_abs_qty == 0 {
+        None
+    } else {
+        Some(Price::new(
+            div_round(weighted_price_value, total_abs_qty, rounding)?,
+            price_scale.unwrap_or(0),
+        ))
+    };
+    position.cost_basis = cost_basis;
+    position.realized_pnl = position.realized_pnl.checked_add(realized_delta)?;
+    position.opened_at_unix_ns = opened_at_unix_ns;
+    position.updated_at_unix_ns = ts_unix_ns;
+    Ok(())
 }
 
 fn apply_average_cost_position_fill(

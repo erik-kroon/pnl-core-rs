@@ -98,6 +98,22 @@ pub(super) fn validate_restored_state(engine: &Engine) -> Result<()> {
             }
         }
     }
+    for lot in engine.lots.values() {
+        let key = lot.position_key();
+        if !engine.positions.contains_key(&key)
+            || lot.remaining_qty.value <= 0
+            || lot.original_qty.value <= 0
+            || lot.remaining_qty.value > lot.original_qty.value
+        {
+            return Err(Error::SnapshotValidation("lot state invalid"));
+        }
+        let account = engine.accounts.get(&lot.account_id).unwrap();
+        if lot.remaining_cost_basis.currency_id != account.base_currency
+            || lot.remaining_cost_basis.scale != engine.config.account_money_scale
+        {
+            return Err(Error::SnapshotValidation("lot money invalid"));
+        }
+    }
     engine
         .replay_journal
         .validate_restored(engine.config.expected_start_seq)?;

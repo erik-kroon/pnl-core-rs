@@ -3,7 +3,7 @@ use crate::config::EngineConfig;
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::metadata::{BookMeta, CurrencyMeta, InstrumentMeta};
-use crate::position::{FxRate, Mark, Position};
+use crate::position::{FxRate, Lot, Mark, Position};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 
@@ -21,13 +21,14 @@ impl StateHash {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CanonicalStateV1 {
+pub struct CanonicalStateV2 {
     pub config: EngineConfig,
     pub currencies: Vec<CurrencyMeta>,
     pub accounts: Vec<AccountState>,
     pub books: Vec<BookMeta>,
     pub instruments: Vec<InstrumentMeta>,
     pub positions: Vec<Position>,
+    pub lots: Vec<Lot>,
     pub marks: Vec<Mark>,
     pub fx_rates: Vec<FxRate>,
     pub seen_events: Vec<EventId>,
@@ -35,7 +36,7 @@ pub struct CanonicalStateV1 {
     pub last_seq: u64,
 }
 
-impl CanonicalStateV1 {
+impl CanonicalStateV2 {
     pub(crate) fn from_engine(engine: &Engine) -> Self {
         Self {
             config: engine.config.clone(),
@@ -44,6 +45,7 @@ impl CanonicalStateV1 {
             books: engine.registry.books().collect(),
             instruments: engine.registry.instruments().cloned().collect(),
             positions: engine.positions.values().cloned().collect(),
+            lots: engine.lots.values().cloned().collect(),
             marks: engine.marks.values().cloned().collect(),
             fx_rates: engine.fx_rates.values().cloned().collect(),
             seen_events: engine
@@ -59,10 +61,10 @@ impl CanonicalStateV1 {
 }
 
 pub(crate) fn hash_engine_state(engine: &Engine) -> StateHash {
-    hash_canonical_state(&CanonicalStateV1::from_engine(engine))
+    hash_canonical_state(&CanonicalStateV2::from_engine(engine))
 }
 
-pub(crate) fn hash_canonical_state(state: &CanonicalStateV1) -> StateHash {
+pub(crate) fn hash_canonical_state(state: &CanonicalStateV2) -> StateHash {
     let bytes = postcard::to_allocvec(state).expect("canonical state should serialize");
     StateHash(*blake3::hash(&bytes).as_bytes())
 }

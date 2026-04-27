@@ -39,7 +39,18 @@ impl Scenario {
     }
 
     pub fn engine(self) -> Engine {
-        let mut engine = Engine::new(EngineConfig::default());
+        self.engine_with_config(EngineConfig::default())
+    }
+
+    pub fn engine_with_accounting_method(self, accounting_method: AccountingMethod) -> Engine {
+        self.engine_with_config(EngineConfig {
+            accounting_method,
+            ..EngineConfig::default()
+        })
+    }
+
+    fn engine_with_config(self, config: EngineConfig) -> Engine {
+        let mut engine = Engine::new(config);
         engine
             .register_currency(CurrencyMeta {
                 currency_id: self.account_currency_id,
@@ -227,6 +238,16 @@ pub fn setup() -> Engine {
 
 pub fn setup_eur_instrument_usd_account() -> Engine {
     Scenario::eur_instrument_usd_account().engine()
+}
+
+pub fn setup_with_accounting_method(accounting_method: AccountingMethod) -> Engine {
+    Scenario::default().engine_with_accounting_method(accounting_method)
+}
+
+pub fn setup_eur_instrument_usd_account_with_accounting_method(
+    accounting_method: AccountingMethod,
+) -> Engine {
+    Scenario::eur_instrument_usd_account().engine_with_accounting_method(accounting_method)
 }
 
 pub fn initial(seq: u64, amount: &str) -> Event {

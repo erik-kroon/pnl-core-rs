@@ -1,8 +1,8 @@
 # Roadmap
 
-`pnl-core-rs` is currently a V1 deterministic accounting engine for ordered
-event replay, fixed-point PnL, snapshots, and state hashes. The roadmap below is
-organized by product maturity rather than calendar dates.
+`pnl-core-rs` is currently a V2 deterministic accounting engine for ordered
+event replay, fixed-point PnL, lot accounting, snapshots, and state hashes. The
+roadmap below is organized by product maturity rather than calendar dates.
 
 ## Guiding Constraints
 
@@ -14,7 +14,7 @@ organized by product maturity rather than calendar dates.
 - Maintain stable snapshot compatibility or provide explicit migration paths
   when compatibility cannot be preserved.
 
-## V1 Hardening
+## Completed V1 Hardening
 
 - Expand golden tests for binary snapshots, JSON snapshots, and state hashes.
 - Add more property tests around position flips, partial closes, fees, rebates,
@@ -25,7 +25,7 @@ organized by product maturity rather than calendar dates.
   implementation detail.
 - Define minimum supported Rust version and CI coverage expectations.
 
-## V1.1 Operational Readiness
+## Completed V1.1 Operational Readiness
 
 - Add configurable output formats for the CLI, including machine-readable JSON
   summaries.
@@ -36,17 +36,24 @@ organized by product maturity rather than calendar dates.
   snapshot read/write performance.
 - Publish crate-level examples for embedding the engine in a service.
 
-## V2 Accounting Model Candidates
+## V2 Lot Accounting
 
-- Lot-based accounting alongside average cost, with explicit method selection.
-- FIFO/LIFO realized PnL policies where required by downstream reporting.
+- Lot-based accounting alongside average cost, with explicit engine-wide method
+  selection.
+- FIFO/LIFO realized PnL policies for downstream reporting.
+- Public open-lot inspection.
+- Snapshot format version `2` with lot state in the canonical hash material.
+
+## Future Accounting Model Candidates
+
 - Corporate-action-style adjustment events for splits and symbol/instrument
   lifecycle changes.
 - Explicit interest, borrow, funding, and financing events.
 - More expressive FX handling, potentially including inverse lookup or routed
   cross rates when explicitly configured.
-- Instrument classes beyond the current spot-like model, starting with futures
-  multipliers and contract metadata.
+- Instrument classes beyond the current spot-like model. Futures must use
+  futures-specific equity and exposure semantics rather than spot-like notional
+  cash behavior.
 
 ## API And Integration Candidates
 
@@ -70,6 +77,8 @@ organized by product maturity rather than calendar dates.
 
 - All documented invariants have focused regression tests.
 - Snapshot compatibility behavior is documented for the release.
+- Snapshot binary, JSON, and state hash outputs have checked-in golden coverage.
+- The workspace MSRV and CI command set are documented for the release.
 - CLI fixtures cover the main README workflows.
 - Benchmarks have been run against the previous release.
 - Changelog entries describe user-visible behavior and compatibility changes.
