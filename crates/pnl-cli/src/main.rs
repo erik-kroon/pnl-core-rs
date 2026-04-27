@@ -209,6 +209,12 @@ fn emit_text_output(
         println!("Position value:         {}", summary.position_market_value);
         println!("Equity:                 {}", summary.equity);
         println!("Realized PnL:           {}", summary.realized_pnl);
+        println!("Trading realized PnL:   {}", summary.trading_realized_pnl);
+        println!("Interest PnL:           {}", summary.interest_pnl);
+        println!("Borrow PnL:             {}", summary.borrow_pnl);
+        println!("Funding PnL:            {}", summary.funding_pnl);
+        println!("Financing PnL:          {}", summary.financing_pnl);
+        println!("Total financing PnL:    {}", summary.total_financing_pnl);
         println!("Unrealized PnL:         {}", summary.unrealized_pnl);
         println!("Total PnL:              {}", summary.total_pnl);
         println!("Gross exposure:         {}", summary.gross_exposure);

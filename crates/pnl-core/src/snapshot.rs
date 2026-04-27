@@ -73,6 +73,10 @@ impl CanonicalStateV2 {
                 .into_iter()
                 .map(|meta| (meta.instrument_id, meta))
                 .collect(),
+            self.instrument_lifecycles
+                .into_iter()
+                .map(|meta| (meta.instrument_id, meta.state))
+                .collect(),
         );
         Engine {
             config: self.config,

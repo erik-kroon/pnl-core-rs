@@ -13,6 +13,8 @@ pub enum Error {
     },
     #[error("unknown instrument {0:?}")]
     UnknownInstrument(InstrumentId),
+    #[error("instrument {0:?} is not active")]
+    InactiveInstrument(InstrumentId),
     #[error("unknown currency {0:?}")]
     UnknownCurrency(CurrencyId),
     #[error("{0}")]
@@ -33,6 +35,10 @@ pub enum Error {
     InvalidPrice,
     #[error("invalid scale")]
     InvalidScale,
+    #[error("invalid split ratio")]
+    InvalidSplitRatio,
+    #[error("invalid symbol")]
+    InvalidSymbol,
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
     #[error("division by zero")]

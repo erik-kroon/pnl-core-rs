@@ -1,3 +1,4 @@
+use crate::metadata::InstrumentLifecycleState;
 use crate::types::{AccountId, BookId, CurrencyId, EventId, InstrumentId, Money, Price, Qty, Side};
 use serde::{Deserialize, Serialize};
 
@@ -13,9 +14,16 @@ pub struct Event {
 pub enum EventKind {
     InitialCash(InitialCash),
     CashAdjustment(CashAdjustment),
+    Interest(FinancingEvent),
+    Borrow(FinancingEvent),
+    Funding(FinancingEvent),
+    Financing(FinancingEvent),
     Fill(Fill),
     Mark(MarkPriceUpdate),
     FxRate(FxRateUpdate),
+    Split(InstrumentSplit),
+    SymbolChange(InstrumentSymbolChange),
+    InstrumentLifecycle(InstrumentLifecycle),
     TradeCorrection(TradeCorrection),
     TradeBust(TradeBust),
 }
@@ -29,6 +37,14 @@ pub struct InitialCash {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashAdjustment {
+    pub account_id: AccountId,
+    pub currency_id: CurrencyId,
+    pub amount: Money,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinancingEvent {
     pub account_id: AccountId,
     pub currency_id: CurrencyId,
     pub amount: Money,
@@ -70,4 +86,26 @@ pub struct FxRateUpdate {
     pub from_currency_id: CurrencyId,
     pub to_currency_id: CurrencyId,
     pub rate: Price,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentSplit {
+    pub instrument_id: InstrumentId,
+    pub numerator: u32,
+    pub denominator: u32,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentSymbolChange {
+    pub instrument_id: InstrumentId,
+    pub symbol: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentLifecycle {
+    pub instrument_id: InstrumentId,
+    pub state: InstrumentLifecycleState,
+    pub reason: Option<String>,
 }

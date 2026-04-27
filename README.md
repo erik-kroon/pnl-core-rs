@@ -30,9 +30,11 @@ candidates.
 - Cash-authoritative accounting.
 - Average-cost, FIFO, and LIFO position accounting.
 - Public open-lot inspection for FIFO/LIFO accounting.
-- Multi-currency instruments and accounts with explicit direct FX conversion.
+- Multi-currency instruments and accounts with explicit FX conversion.
 - Fill fees, including rebates and non-account-currency fees.
+- Interest, borrow, funding, and financing PnL buckets.
 - Marks, FX revaluation, gross/net exposure, unrealized PnL, and leverage.
+- Split, symbol change, and instrument lifecycle events.
 - Trade corrections and busts through deterministic historical replay.
 - Versioned binary `.pnlsnap` snapshot/restore.
 - JSON snapshot export for inspection and golden tests.
@@ -45,7 +47,7 @@ candidates.
 - Replay is strict and contiguous by sequence number.
 - Duplicate event IDs are rejected.
 - Accounting method selection is engine-wide and explicit.
-- FX conversion uses explicit direct rates only.
+- FX conversion uses direct rates first, with opt-in inverse and one-pivot cross routing.
 - Snapshots encode canonical state, not raw implementation internals.
 - State hashes are deterministic fingerprints, not cryptographic audit proofs.
 
@@ -137,10 +139,17 @@ engine.apply(Event {
     }),
 })?;
 
+let report = engine.apply_many([])?;
+assert_eq!(report.state_hash, engine.state_hash());
+
 let summary = engine.account_summary(AccountId(1))?;
 println!("{summary:?}");
 # Ok::<(), pnl_core::Error>(())
 ```
+
+`apply` returns a lightweight per-event receipt. `apply_many` is the preferred
+bulk replay API and computes one final deterministic state hash for the replay
+report.
 
 For a service-style embedding example with ingestion, summary reads, snapshot
 write, and restore, see
@@ -182,9 +191,16 @@ Supported event types:
 
 - `initial_cash`
 - `cash_adjustment`
+- `interest`
+- `borrow`
+- `funding`
+- `financing`
 - `fill`
 - `mark`
 - `fx_rate`
+- `split`
+- `symbol_change`
+- `instrument_lifecycle`
 - `trade_correction`
 - `trade_bust`
 
@@ -194,9 +210,39 @@ An `fx_rate` event supplies target currency units per one source currency unit:
 {"seq":2,"type":"fx_rate","from_currency":"EUR","to_currency":"USD","rate":"1.10","ts_unix_ns":2}
 ```
 
-Cross-currency fills, fees, and marked exposures require a direct rate from the
-source currency to the account currency unless both currencies are the same.
-Inverse and cross-rate routing are not inferred.
+Cross-currency fills, fees, and marked exposures use direct rates first. By
+default, missing direct rates are rejected. `EngineConfig::fx_routing` can opt
+into inverse lookup and configured one-pivot cross-rate routes; arbitrary graph
+routing is not inferred.
+
+Financing events are account-level signed cash deltas. Positive amounts credit
+cash and PnL; negative amounts debit cash and PnL. Amount currency must match
+the account base currency. `realized_pnl` remains inclusive, while summaries
+also expose trading, interest, borrow, funding, financing, and total financing
+PnL buckets:
+
+```json
+{"seq":6,"type":"interest","account_id":1,"currency":"USD","amount":"12.50","reason":"cash interest","ts_unix_ns":6}
+{"seq":7,"type":"borrow","account_id":1,"currency":"USD","amount":"-3.00","reason":"stock borrow","ts_unix_ns":7}
+```
+
+Split events adjust open positions, FIFO/LIFO lots, average prices, lot entry
+prices, and the latest mark for the instrument while leaving cash, realized PnL,
+and cost basis unchanged:
+
+```json
+{"seq":6,"type":"split","instrument_id":1,"numerator":2,"denominator":1,"reason":"2-for-1 split","ts_unix_ns":6}
+```
+
+Reverse splits must be exactly representable at the instrument quantity scale.
+Symbol changes update instrument metadata without changing accounting state, and
+instrument lifecycle events set an instrument to `active`, `halted`, or
+`delisted`. New fills are accepted only while the instrument is active.
+
+```json
+{"seq":7,"type":"symbol_change","instrument_id":1,"symbol":"META","ts_unix_ns":7}
+{"seq":8,"type":"instrument_lifecycle","instrument_id":1,"lifecycle_state":"halted","reason":"exchange halt","ts_unix_ns":8}
+```
 
 Corrections and busts target prior fill events:
 
@@ -233,6 +279,8 @@ Configuration is TOML:
 base_currency = "USD"
 account_money_scale = 4
 accounting_method = "average_cost" # "fifo" or "lifo"
+fx_allow_inverse = false
+fx_cross_rate_pivots = []
 allow_short = true
 allow_position_flip = true
 expected_start_seq = 1
@@ -258,6 +306,7 @@ Events are newline-delimited JSON:
 {"seq":1,"type":"initial_cash","account_id":1,"currency":"USD","amount":"100000.00","ts_unix_ns":1}
 {"seq":2,"type":"fill","account_id":1,"book_id":1,"instrument_id":1,"side":"buy","qty":"100","price":"185.00","fee":"1.00","ts_unix_ns":2}
 {"seq":3,"type":"mark","instrument_id":1,"price":"187.50","ts_unix_ns":3}
+{"seq":4,"type":"interest","account_id":1,"currency":"USD","amount":"12.50","reason":"cash interest","ts_unix_ns":4}
 ```
 
 ## Snapshots
@@ -293,11 +342,10 @@ The codebase is split around the main accounting seams:
 
 ## Known Limitations
 
-- Direct FX rates only; inverse and cross rates are not inferred.
-- Average-cost accounting only.
-- No FIFO/LIFO lots.
+- FX routing is limited to direct rates, opt-in inverse lookup, and configured
+  one-pivot cross rates.
 - No settlement model.
-- No dividends, funding payments, borrow fees, or financing.
+- No dividends.
 - No broker connectors, order management, or strategy logic.
 - No Python, C, or WASM bindings in V2.
 - No Arrow or Parquet export in V2.
@@ -314,7 +362,10 @@ cargo bench -p pnl-core
 ```
 
 Benchmark output is hardware-dependent. Current benchmark targets cover
-`apply_fill`, `apply_mark`, `replay_1k_events`, and `snapshot_restore`.
+single-event apply, replay throughput by event count, correction/bust replay
+cost, FIFO/LIFO lot-heavy replay, FX cross-route revaluation, and snapshot
+read/write time. Baseline notes and acceptance targets live in
+`crates/pnl-core/benches/PERF_BASELINES.md`.
 
 ## Roadmap
 

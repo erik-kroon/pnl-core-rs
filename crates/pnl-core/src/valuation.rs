@@ -1,18 +1,20 @@
+use crate::config::FxRoutingConfig;
 use crate::error::{Error, Result};
 use crate::event::{FxRateUpdate, MarkPriceUpdate};
 use crate::metadata::InstrumentMeta;
 use crate::position::{FxRate, Mark, Position, PositionKey};
 use crate::registry::Registry;
 use crate::types::{
-    convert_money_with_rate, money_from_components, value_qty_price_multiplier, CurrencyId, Money,
-    Price, RoundingMode,
+    checked_pow10, convert_money_with_rate, div_round, money_from_components,
+    value_qty_price_multiplier, CurrencyId, InstrumentId, Money, Price, RoundingMode,
 };
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ValuationConfig {
     pub(crate) account_money_scale: u8,
     pub(crate) rounding_mode: RoundingMode,
+    pub(crate) fx_routing: FxRoutingConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +34,93 @@ pub(crate) struct AccountPositionTotals {
     pub(crate) open_positions: u32,
 }
 
-pub(crate) fn normalize_mark(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValuationUpdateResult {
+    pub(crate) changed_positions: Vec<PositionKey>,
+}
+
+pub(crate) struct ValuationStores<'a> {
+    pub(crate) registry: &'a Registry,
+    pub(crate) positions: &'a mut BTreeMap<PositionKey, Position>,
+    pub(crate) marks: &'a mut BTreeMap<InstrumentId, Mark>,
+    pub(crate) fx_rates: &'a mut BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+}
+
+pub(crate) fn apply_mark_update(
+    mark: &MarkPriceUpdate,
+    stores: ValuationStores<'_>,
+    config: ValuationConfig,
+    ts_unix_ns: i64,
+) -> Result<ValuationUpdateResult> {
+    let instrument = stores.registry.instrument(mark.instrument_id)?.clone();
+    let normalized_mark = normalize_mark(mark, &instrument, config.clone(), ts_unix_ns)?;
+    let changed_positions = positions_affected_by_mark(stores.positions, mark.instrument_id);
+    ensure_resolved_rates_for_positions(
+        &changed_positions,
+        stores.registry,
+        instrument.currency_id,
+        stores.fx_rates,
+        &config,
+    )?;
+
+    stores.marks.insert(mark.instrument_id, normalized_mark);
+    for key in &changed_positions {
+        let account_currency = stores.registry.account_currency(key.account_id)?;
+        let mut position = stores.positions.remove(key).unwrap();
+        revalue_position(
+            &mut position,
+            &instrument,
+            account_currency,
+            stores.marks.get(&key.instrument_id),
+            stores.fx_rates,
+            config.clone(),
+        )?;
+        stores.positions.insert(*key, position);
+    }
+
+    Ok(ValuationUpdateResult { changed_positions })
+}
+
+pub(crate) fn apply_fx_rate_update(
+    fx: &FxRateUpdate,
+    stores: ValuationStores<'_>,
+    config: ValuationConfig,
+    ts_unix_ns: i64,
+) -> Result<ValuationUpdateResult> {
+    stores.registry.ensure_currency(fx.from_currency_id)?;
+    stores.registry.ensure_currency(fx.to_currency_id)?;
+    let rate = normalize_fx_rate(fx, config.clone(), ts_unix_ns)?;
+    stores
+        .fx_rates
+        .insert((fx.from_currency_id, fx.to_currency_id), rate);
+
+    let changed_positions = positions_affected_by_fx_rate(
+        stores.positions,
+        stores.registry,
+        fx.from_currency_id,
+        fx.to_currency_id,
+        stores.fx_rates,
+        &config,
+    );
+    for key in &changed_positions {
+        let instrument = stores.registry.instrument(key.instrument_id)?.clone();
+        let account_currency = stores.registry.account_currency(key.account_id)?;
+        let mut position = stores.positions.remove(key).unwrap();
+        revalue_position(
+            &mut position,
+            &instrument,
+            account_currency,
+            stores.marks.get(&key.instrument_id),
+            stores.fx_rates,
+            config.clone(),
+        )?;
+        stores.positions.insert(*key, position);
+    }
+
+    Ok(ValuationUpdateResult { changed_positions })
+}
+
+fn normalize_mark(
     mark: &MarkPriceUpdate,
     instrument: &InstrumentMeta,
     config: ValuationConfig,
@@ -47,7 +135,7 @@ pub(crate) fn normalize_mark(
     })
 }
 
-pub(crate) fn normalize_fx_rate(
+fn normalize_fx_rate(
     fx: &FxRateUpdate,
     config: ValuationConfig,
     ts_unix_ns: i64,
@@ -78,7 +166,7 @@ pub(crate) fn convert_money(
             config.rounding_mode,
         );
     }
-    let rate = direct_rate(rates, money.currency_id, to_currency_id)?;
+    let rate = resolved_rate(rates, money.currency_id, to_currency_id, &config)?;
     convert_money_with_rate(
         money,
         to_currency_id,
@@ -88,12 +176,14 @@ pub(crate) fn convert_money(
     )
 }
 
-pub(crate) fn ensure_direct_rate(
+pub(crate) fn ensure_resolved_rate(
     rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
     from_currency_id: CurrencyId,
     to_currency_id: CurrencyId,
+    config: &ValuationConfig,
 ) -> Result<()> {
-    if from_currency_id == to_currency_id || rates.contains_key(&(from_currency_id, to_currency_id))
+    if from_currency_id == to_currency_id
+        || resolved_rate(rates, from_currency_id, to_currency_id, config).is_ok()
     {
         return Ok(());
     }
@@ -205,7 +295,7 @@ pub(crate) fn account_position_totals<'a>(
     Ok(totals)
 }
 
-pub(crate) fn positions_affected_by_mark(
+fn positions_affected_by_mark(
     positions: &BTreeMap<PositionKey, Position>,
     instrument_id: crate::types::InstrumentId,
 ) -> Vec<PositionKey> {
@@ -216,51 +306,184 @@ pub(crate) fn positions_affected_by_mark(
         .collect()
 }
 
-pub(crate) fn positions_affected_by_fx_rate(
+fn positions_affected_by_fx_rate(
     positions: &BTreeMap<PositionKey, Position>,
     registry: &Registry,
     from_currency_id: CurrencyId,
     to_currency_id: CurrencyId,
+    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    config: &ValuationConfig,
 ) -> Vec<PositionKey> {
     positions
         .keys()
         .copied()
         .filter(|key| {
-            registry
-                .instrument(key.instrument_id)
-                .is_ok_and(|instrument| instrument.currency_id == from_currency_id)
-                && registry
-                    .account_currency(key.account_id)
-                    .is_ok_and(|currency| currency == to_currency_id)
+            let Ok(instrument) = registry.instrument(key.instrument_id) else {
+                return false;
+            };
+            let Ok(account_currency) = registry.account_currency(key.account_id) else {
+                return false;
+            };
+            selected_route_uses_pair(
+                rates,
+                instrument.currency_id,
+                account_currency,
+                from_currency_id,
+                to_currency_id,
+                config,
+            )
         })
         .collect()
 }
 
-pub(crate) fn ensure_direct_rates_for_positions(
+fn ensure_resolved_rates_for_positions(
     keys: &[PositionKey],
     registry: &Registry,
     instrument_currency_id: CurrencyId,
     rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    config: &ValuationConfig,
 ) -> Result<()> {
     for key in keys {
         let account_currency = registry.account_currency(key.account_id)?;
-        ensure_direct_rate(rates, instrument_currency_id, account_currency)?;
+        ensure_resolved_rate(rates, instrument_currency_id, account_currency, config)?;
     }
     Ok(())
+}
+
+fn resolved_rate(
+    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    from_currency_id: CurrencyId,
+    to_currency_id: CurrencyId,
+    config: &ValuationConfig,
+) -> Result<Price> {
+    if let Some(rate) = direct_rate(rates, from_currency_id, to_currency_id) {
+        return Ok(rate);
+    }
+    if let Some(rate) = leg_rate(rates, from_currency_id, to_currency_id, config)? {
+        return Ok(rate);
+    }
+    for pivot in &config.fx_routing.cross_rate_pivots {
+        if *pivot == from_currency_id || *pivot == to_currency_id {
+            continue;
+        }
+        let Some(first) = leg_rate(rates, from_currency_id, *pivot, config)? else {
+            continue;
+        };
+        let Some(second) = leg_rate(rates, *pivot, to_currency_id, config)? else {
+            continue;
+        };
+        return multiply_rates(first, second);
+    }
+    Err(Error::MissingFxRate {
+        from_currency: from_currency_id,
+        to_currency: to_currency_id,
+    })
+}
+
+fn selected_route_uses_pair(
+    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    from_currency_id: CurrencyId,
+    to_currency_id: CurrencyId,
+    updated_from_currency_id: CurrencyId,
+    updated_to_currency_id: CurrencyId,
+    config: &ValuationConfig,
+) -> bool {
+    if from_currency_id == to_currency_id {
+        return false;
+    }
+    if direct_rate(rates, from_currency_id, to_currency_id).is_some() {
+        return from_currency_id == updated_from_currency_id
+            && to_currency_id == updated_to_currency_id;
+    }
+    if let Ok(Some(used)) = leg_rate_source(rates, from_currency_id, to_currency_id, config) {
+        return used == (updated_from_currency_id, updated_to_currency_id);
+    }
+    for pivot in &config.fx_routing.cross_rate_pivots {
+        if *pivot == from_currency_id || *pivot == to_currency_id {
+            continue;
+        }
+        let Ok(Some(first)) = leg_rate_source(rates, from_currency_id, *pivot, config) else {
+            continue;
+        };
+        let Ok(Some(second)) = leg_rate_source(rates, *pivot, to_currency_id, config) else {
+            continue;
+        };
+        return first == (updated_from_currency_id, updated_to_currency_id)
+            || second == (updated_from_currency_id, updated_to_currency_id);
+    }
+    false
 }
 
 fn direct_rate(
     rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
     from_currency_id: CurrencyId,
     to_currency_id: CurrencyId,
-) -> Result<Price> {
+) -> Option<Price> {
     rates
         .get(&(from_currency_id, to_currency_id))
         .map(|rate| rate.rate)
-        .ok_or(Error::MissingFxRate {
-            from_currency: from_currency_id,
-            to_currency: to_currency_id,
-        })
+}
+
+fn leg_rate(
+    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    from_currency_id: CurrencyId,
+    to_currency_id: CurrencyId,
+    config: &ValuationConfig,
+) -> Result<Option<Price>> {
+    if let Some(rate) = direct_rate(rates, from_currency_id, to_currency_id) {
+        return Ok(Some(rate));
+    }
+    if config.fx_routing.allow_inverse {
+        if let Some(rate) = direct_rate(rates, to_currency_id, from_currency_id) {
+            return Ok(Some(invert_rate(rate, config)?));
+        }
+    }
+    Ok(None)
+}
+
+fn leg_rate_source(
+    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    from_currency_id: CurrencyId,
+    to_currency_id: CurrencyId,
+    config: &ValuationConfig,
+) -> Result<Option<(CurrencyId, CurrencyId)>> {
+    if direct_rate(rates, from_currency_id, to_currency_id).is_some() {
+        return Ok(Some((from_currency_id, to_currency_id)));
+    }
+    if config.fx_routing.allow_inverse
+        && direct_rate(rates, to_currency_id, from_currency_id).is_some()
+    {
+        return Ok(Some((to_currency_id, from_currency_id)));
+    }
+    Ok(None)
+}
+
+fn invert_rate(rate: Price, config: &ValuationConfig) -> Result<Price> {
+    if rate.value <= 0 {
+        return Err(Error::InvalidPrice);
+    }
+    let target_scale = rate.scale.max(config.account_money_scale.saturating_add(4));
+    let numer_scale = target_scale
+        .checked_add(rate.scale)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let numer = checked_pow10(numer_scale)?;
+    Ok(Price::new(
+        div_round(numer, rate.value, config.rounding_mode)?,
+        target_scale,
+    ))
+}
+
+fn multiply_rates(first: Price, second: Price) -> Result<Price> {
+    Ok(Price::new(
+        first
+            .value
+            .checked_mul(second.value)
+            .ok_or(Error::ArithmeticOverflow)?,
+        first
+            .scale
+            .checked_add(second.scale)
+            .ok_or(Error::ArithmeticOverflow)?,
+    ))
 }
 
 #[cfg(test)]
@@ -277,10 +500,15 @@ mod tests {
         CurrencyId::from_code_const(*b"EUR")
     }
 
+    fn gbp() -> CurrencyId {
+        CurrencyId::from_code_const(*b"GBP")
+    }
+
     fn config() -> ValuationConfig {
         ValuationConfig {
             account_money_scale: 2,
             rounding_mode: RoundingMode::HalfEven,
+            fx_routing: FxRoutingConfig::default(),
         }
     }
 
@@ -360,6 +588,29 @@ mod tests {
         registry
     }
 
+    fn registry_with_gbp() -> Registry {
+        let mut registry = registry();
+        registry
+            .register_currency(
+                CurrencyMeta {
+                    currency_id: gbp(),
+                    code: "GBP".to_string(),
+                    scale: 2,
+                },
+                2,
+            )
+            .unwrap();
+        registry
+    }
+
+    fn key() -> PositionKey {
+        PositionKey {
+            account_id: AccountId(1),
+            book_id: BookId(1),
+            instrument_id: InstrumentId(1),
+        }
+    }
+
     #[test]
     fn value_position_falls_back_to_cost_basis_without_mark() {
         let instrument = instrument(usd());
@@ -432,18 +683,257 @@ mod tests {
     }
 
     #[test]
+    fn direct_fx_conversion_wins_over_enabled_inverse() {
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (eur(), usd()),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: usd(),
+                rate: price("1.20"),
+                ts_unix_ns: 1,
+            },
+        );
+        rates.insert(
+            (usd(), eur()),
+            FxRate {
+                from_currency_id: usd(),
+                to_currency_id: eur(),
+                rate: price("0.50"),
+                ts_unix_ns: 2,
+            },
+        );
+        let mut config = config();
+        config.fx_routing.allow_inverse = true;
+
+        let converted = convert_money(money("10.00", eur()), usd(), &rates, config).unwrap();
+
+        assert_eq!(converted, money("12.00", usd()));
+    }
+
+    #[test]
+    fn enabled_inverse_fx_conversion_uses_inverse_rate() {
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (usd(), eur()),
+            FxRate {
+                from_currency_id: usd(),
+                to_currency_id: eur(),
+                rate: price("0.80"),
+                ts_unix_ns: 1,
+            },
+        );
+        let mut config = config();
+        config.fx_routing.allow_inverse = true;
+
+        let converted = convert_money(money("10.00", eur()), usd(), &rates, config).unwrap();
+
+        assert_eq!(converted, money("12.50", usd()));
+    }
+
+    #[test]
+    fn configured_cross_route_converts_through_first_resolvable_pivot() {
+        let gbp = CurrencyId::from_code_const(*b"GBP");
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (eur(), gbp),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: gbp,
+                rate: price("0.80"),
+                ts_unix_ns: 1,
+            },
+        );
+        rates.insert(
+            (gbp, usd()),
+            FxRate {
+                from_currency_id: gbp,
+                to_currency_id: usd(),
+                rate: price("1.25"),
+                ts_unix_ns: 2,
+            },
+        );
+        let mut config = config();
+        config.fx_routing.cross_rate_pivots = vec![gbp];
+
+        let converted = convert_money(money("10.00", eur()), usd(), &rates, config).unwrap();
+
+        assert_eq!(converted, money("10.00", usd()));
+    }
+
+    #[test]
+    fn configured_cross_route_uses_pivot_order() {
+        let gbp = CurrencyId::from_code_const(*b"GBP");
+        let chf = CurrencyId::from_code_const(*b"CHF");
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (eur(), gbp),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: gbp,
+                rate: price("0.80"),
+                ts_unix_ns: 1,
+            },
+        );
+        rates.insert(
+            (gbp, usd()),
+            FxRate {
+                from_currency_id: gbp,
+                to_currency_id: usd(),
+                rate: price("1.25"),
+                ts_unix_ns: 2,
+            },
+        );
+        rates.insert(
+            (eur(), chf),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: chf,
+                rate: price("0.90"),
+                ts_unix_ns: 3,
+            },
+        );
+        rates.insert(
+            (chf, usd()),
+            FxRate {
+                from_currency_id: chf,
+                to_currency_id: usd(),
+                rate: price("2.00"),
+                ts_unix_ns: 4,
+            },
+        );
+        let mut config = config();
+        config.fx_routing.cross_rate_pivots = vec![chf, gbp];
+
+        let converted = convert_money(money("10.00", eur()), usd(), &rates, config).unwrap();
+
+        assert_eq!(converted, money("18.00", usd()));
+    }
+
+    #[test]
     fn fx_rate_affects_positions_matching_instrument_and_account_currency() {
-        let key = PositionKey {
-            account_id: AccountId(1),
-            book_id: BookId(1),
-            instrument_id: InstrumentId(1),
-        };
+        let key = key();
         let mut positions = BTreeMap::new();
         positions.insert(key, position(money("1000.00", usd())));
         let registry = registry();
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (eur(), usd()),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: usd(),
+                rate: price("1.10"),
+                ts_unix_ns: 1,
+            },
+        );
+        let config = config();
 
-        let affected = positions_affected_by_fx_rate(&positions, &registry, eur(), usd());
+        let affected =
+            positions_affected_by_fx_rate(&positions, &registry, eur(), usd(), &rates, &config);
 
         assert_eq!(affected, vec![key]);
+    }
+
+    #[test]
+    fn mark_update_normalizes_discovers_and_revalues_positions() {
+        let key = key();
+        let registry = registry();
+        let mut positions = BTreeMap::new();
+        positions.insert(key, position(money("1000.00", usd())));
+        let mut marks = BTreeMap::new();
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (eur(), usd()),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: usd(),
+                rate: price("1.10"),
+                ts_unix_ns: 1,
+            },
+        );
+
+        let result = apply_mark_update(
+            &MarkPriceUpdate {
+                instrument_id: InstrumentId(1),
+                price: price("110.001"),
+            },
+            ValuationStores {
+                registry: &registry,
+                positions: &mut positions,
+                marks: &mut marks,
+                fx_rates: &mut rates,
+            },
+            config(),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(result.changed_positions, vec![key]);
+        assert_eq!(marks.get(&InstrumentId(1)).unwrap().price, price("110.00"));
+        let position = positions.get(&key).unwrap();
+        assert_eq!(position.net_exposure, money("1210.00", usd()));
+        assert_eq!(position.gross_exposure, money("1210.00", usd()));
+        assert_eq!(position.unrealized_pnl, money("210.00", usd()));
+    }
+
+    #[test]
+    fn fx_update_revalues_positions_using_updated_cross_route_leg() {
+        let key = key();
+        let registry = registry_with_gbp();
+        let mut positions = BTreeMap::new();
+        positions.insert(key, position(money("1000.00", usd())));
+        let mut marks = BTreeMap::new();
+        marks.insert(
+            InstrumentId(1),
+            Mark {
+                instrument_id: InstrumentId(1),
+                price: price("110.00"),
+                ts_unix_ns: 3,
+            },
+        );
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (eur(), gbp()),
+            FxRate {
+                from_currency_id: eur(),
+                to_currency_id: gbp(),
+                rate: price("0.80"),
+                ts_unix_ns: 1,
+            },
+        );
+        rates.insert(
+            (gbp(), usd()),
+            FxRate {
+                from_currency_id: gbp(),
+                to_currency_id: usd(),
+                rate: price("1.25"),
+                ts_unix_ns: 2,
+            },
+        );
+        let mut config = config();
+        config.fx_routing.cross_rate_pivots = vec![gbp()];
+
+        let result = apply_fx_rate_update(
+            &FxRateUpdate {
+                from_currency_id: gbp(),
+                to_currency_id: usd(),
+                rate: price("1.50"),
+            },
+            ValuationStores {
+                registry: &registry,
+                positions: &mut positions,
+                marks: &mut marks,
+                fx_rates: &mut rates,
+            },
+            config,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(result.changed_positions, vec![key]);
+        assert_eq!(rates.get(&(gbp(), usd())).unwrap().rate, price("1.50"));
+        let position = positions.get(&key).unwrap();
+        assert_eq!(position.net_exposure, money("1320.00", usd()));
+        assert_eq!(position.unrealized_pnl, money("320.00", usd()));
     }
 }

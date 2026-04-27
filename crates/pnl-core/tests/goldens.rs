@@ -105,6 +105,7 @@ fn representative_engine(accounting_method: AccountingMethod) -> Engine {
             ),
             bust(10, EventId(7)),
             mark(11, 2, "110.00"),
+            interest(12, 1, "-3.25"),
         ])
         .unwrap();
 
@@ -199,6 +200,18 @@ fn cash_adjustment(seq: u64, account_id: u64, amount: &str) -> Event {
             currency_id: CurrencyId::usd(),
             amount: money(amount, CurrencyId::usd()),
             reason: Some("external transfer".to_string()),
+        }),
+    )
+}
+
+fn interest(seq: u64, account_id: u64, amount: &str) -> Event {
+    event(
+        seq,
+        EventKind::Interest(FinancingEvent {
+            account_id: AccountId(account_id),
+            currency_id: CurrencyId::usd(),
+            amount: money(amount, CurrencyId::usd()),
+            reason: Some("cash interest".to_string()),
         }),
     )
 }

@@ -31,7 +31,7 @@ impl PnlService {
         Ok(Self { engine })
     }
 
-    fn ingest(&mut self, event: Event) -> Result<ApplyResult> {
+    fn ingest(&mut self, event: Event) -> Result<ApplyReceipt> {
         self.engine.apply(event)
     }
 

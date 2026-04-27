@@ -3,4 +3,4 @@
 {"seq":3,"type":"mark","instrument_id":1,"price":"187.50","ts_unix_ns":3}
 {"seq":4,"type":"fill","account_id":1,"book_id":1,"instrument_id":1,"side":"sell","qty":"40","price":"188.00","fee":"1.00","ts_unix_ns":4}
 {"seq":5,"type":"cash_adjustment","account_id":1,"currency":"USD","amount":"5000.00","reason":"deposit","ts_unix_ns":5}
-
+{"seq":6,"type":"interest","account_id":1,"currency":"USD","amount":"12.50","reason":"cash interest","ts_unix_ns":6}

@@ -1,39 +1,39 @@
 {
   "metadata": {
-    "last_applied_event_seq": 11,
+    "last_applied_event_seq": 12,
     "state_hash": [
-      110,
-      133,
-      37,
-      56,
-      175,
-      176,
-      1,
-      27,
-      172,
-      242,
-      94,
-      102,
-      16,
-      31,
-      15,
-      120,
-      51,
-      194,
-      16,
-      98,
-      41,
-      226,
-      250,
-      87,
+      205,
+      99,
       123,
-      155,
-      185,
-      1,
-      21,
-      155,
-      248,
-      69
+      241,
+      16,
+      175,
+      178,
+      102,
+      33,
+      226,
+      196,
+      121,
+      214,
+      221,
+      0,
+      213,
+      170,
+      128,
+      5,
+      15,
+      51,
+      96,
+      73,
+      35,
+      112,
+      199,
+      225,
+      70,
+      193,
+      147,
+      120,
+      77
     ],
     "producer": "pnl-core-rs",
     "build_version": "0.1.0",
@@ -46,6 +46,10 @@
       "account_money_scale": 4,
       "rounding_mode": "HalfEven",
       "accounting_method": "AverageCost",
+      "fx_routing": {
+        "allow_inverse": false,
+        "cross_rate_pivots": []
+      },
       "cash_authoritative": true,
       "allow_short": true,
       "allow_position_flip": true,
@@ -73,7 +77,7 @@
           "currency_id": 5591876
         },
         "cash": {
-          "amount": 79968000,
+          "amount": 79935500,
           "scale": 4,
           "currency_id": 5591876
         },
@@ -82,8 +86,38 @@
           "scale": 4,
           "currency_id": 5591876
         },
-        "realized_pnl": {
+        "trading_realized_pnl": {
           "amount": -32000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "interest_pnl": {
+          "amount": -32500,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "borrow_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "funding_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "financing_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "total_financing_pnl": {
+          "amount": -32500,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "realized_pnl": {
+          "amount": -64500,
           "scale": 4,
           "currency_id": 5591876
         },
@@ -93,12 +127,12 @@
           "currency_id": 5591876
         },
         "current_drawdown": {
-          "amount": 0,
+          "amount": -32500,
           "scale": 4,
           "currency_id": 5591876
         },
         "max_drawdown": {
-          "amount": -22000,
+          "amount": -32500,
           "scale": 4,
           "currency_id": 5591876
         },
@@ -119,6 +153,36 @@
         },
         "net_external_cash_flows": {
           "amount": 1000000,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "trading_realized_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "interest_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "borrow_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "funding_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "financing_pnl": {
+          "amount": 0,
+          "scale": 4,
+          "currency_id": 5591876
+        },
+        "total_financing_pnl": {
+          "amount": 0,
           "scale": 4,
           "currency_id": 5591876
         },
@@ -181,6 +245,16 @@
           "value": 1,
           "scale": 0
         }
+      }
+    ],
+    "instrument_lifecycles": [
+      {
+        "instrument_id": 1,
+        "state": "Active"
+      },
+      {
+        "instrument_id": 2,
+        "state": "Active"
       }
     ],
     "positions": [
@@ -310,7 +384,8 @@
       8,
       9,
       10,
-      11
+      11,
+      12
     ],
     "event_log": [
       {
@@ -523,8 +598,25 @@
             }
           }
         }
+      },
+      {
+        "seq": 12,
+        "event_id": 12,
+        "ts_unix_ns": 12,
+        "kind": {
+          "Interest": {
+            "account_id": 1,
+            "currency_id": 5591876,
+            "amount": {
+              "amount": -32500,
+              "scale": 4,
+              "currency_id": 5591876
+            },
+            "reason": "cash interest"
+          }
+        }
       }
     ],
-    "last_seq": 11
+    "last_seq": 12
   }
 }

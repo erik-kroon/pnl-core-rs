@@ -2,7 +2,7 @@ use crate::account::AccountState;
 use crate::config::EngineConfig;
 use crate::engine::Engine;
 use crate::event::Event;
-use crate::metadata::{BookMeta, CurrencyMeta, InstrumentMeta};
+use crate::metadata::{BookMeta, CurrencyMeta, InstrumentLifecycleMeta, InstrumentMeta};
 use crate::position::{FxRate, Lot, Mark, Position};
 use crate::types::*;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ pub struct CanonicalStateV2 {
     pub accounts: Vec<AccountState>,
     pub books: Vec<BookMeta>,
     pub instruments: Vec<InstrumentMeta>,
+    pub instrument_lifecycles: Vec<InstrumentLifecycleMeta>,
     pub positions: Vec<Position>,
     pub lots: Vec<Lot>,
     pub marks: Vec<Mark>,
@@ -44,6 +45,7 @@ impl CanonicalStateV2 {
             accounts: engine.accounts.values().cloned().collect(),
             books: engine.registry.books().collect(),
             instruments: engine.registry.instruments().cloned().collect(),
+            instrument_lifecycles: engine.registry.instrument_lifecycles().collect(),
             positions: engine.positions.values().cloned().collect(),
             lots: engine.lots.values().cloned().collect(),
             marks: engine.marks.values().cloned().collect(),
@@ -144,13 +146,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_result_hash_is_computed_after_apply() {
+    fn apply_receipt_does_not_compute_state_hash() {
         let mut engine = registered_engine();
         let before = hash_engine_state(&engine);
 
         let result = engine.apply(initial_cash(1, EventId(1))).unwrap();
 
-        assert_ne!(result.state_hash, before);
-        assert_eq!(result.state_hash, hash_engine_state(&engine));
+        assert_eq!(result.sequence, 1);
+        assert_ne!(hash_engine_state(&engine), before);
+    }
+
+    #[test]
+    fn apply_many_reports_one_final_state_hash() {
+        let mut engine = registered_engine();
+
+        let report = engine.apply_many([initial_cash(1, EventId(1))]).unwrap();
+
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.last_sequence, 1);
+        assert_eq!(report.state_hash, hash_engine_state(&engine));
     }
 }

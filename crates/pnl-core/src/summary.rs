@@ -4,11 +4,17 @@ use crate::types::{AccountId, CurrencyId, Money, Ratio};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApplyResult {
+pub struct ApplyReceipt {
     pub sequence: u64,
     pub changed_positions: Vec<PositionKey>,
     pub realized_pnl_delta: Money,
     pub cash_delta: Money,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayReport {
+    pub applied: u64,
+    pub last_sequence: u64,
     pub state_hash: StateHash,
 }
 
@@ -19,6 +25,12 @@ pub struct AccountSummary {
     pub cash: Money,
     pub position_market_value: Money,
     pub equity: Money,
+    pub trading_realized_pnl: Money,
+    pub interest_pnl: Money,
+    pub borrow_pnl: Money,
+    pub funding_pnl: Money,
+    pub financing_pnl: Money,
+    pub total_financing_pnl: Money,
     pub realized_pnl: Money,
     pub unrealized_pnl: Money,
     pub total_pnl: Money,

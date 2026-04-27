@@ -163,6 +163,125 @@ fn cross_currency_fill_requires_direct_fx_rate() {
 }
 
 #[test]
+fn cross_currency_fill_can_use_enabled_inverse_fx_route() {
+    let mut engine = setup_eur_instrument_usd_account_with_config(EngineConfig {
+        fx_routing: FxRoutingConfig {
+            allow_inverse: true,
+            cross_rate_pivots: Vec::new(),
+        },
+        ..EngineConfig::default()
+    });
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine
+        .apply(fx(2, CurrencyId::usd(), eur(), "0.80"))
+        .unwrap();
+    engine.apply(fill(3, Side::Buy, 10, "100.00", "0")).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+
+    assert_eq!(summary.cash, money("8750.00"));
+    assert_eq!(
+        engine.position(position_key()).unwrap().cost_basis,
+        money("1250.00")
+    );
+}
+
+#[test]
+fn mark_valuation_can_use_one_pivot_cross_route_and_revalues_on_fx_update() {
+    let mut engine = setup_eur_instrument_usd_account_with_config(EngineConfig {
+        fx_routing: FxRoutingConfig {
+            allow_inverse: false,
+            cross_rate_pivots: vec![gbp()],
+        },
+        ..EngineConfig::default()
+    });
+    engine
+        .register_currency(CurrencyMeta {
+            currency_id: gbp(),
+            code: "GBP".to_string(),
+            scale: ACCOUNT_MONEY_SCALE,
+        })
+        .unwrap();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fx(2, eur(), gbp(), "0.80")).unwrap();
+    engine
+        .apply(fx(3, gbp(), CurrencyId::usd(), "1.25"))
+        .unwrap();
+    engine.apply(fill(4, Side::Buy, 10, "100.00", "0")).unwrap();
+    engine.apply(mark(5, "110.00")).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    assert_eq!(summary.position_market_value, money("1100.00"));
+    assert_eq!(summary.unrealized_pnl, money("100.00"));
+
+    engine
+        .apply(fx(6, gbp(), CurrencyId::usd(), "1.50"))
+        .unwrap();
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    assert_eq!(summary.position_market_value, money("1320.00"));
+    assert_eq!(summary.unrealized_pnl, money("320.00"));
+}
+
+#[test]
+fn fifo_lots_use_enabled_inverse_fx_for_entry_and_close() {
+    let mut engine = setup_eur_instrument_usd_account_with_config(EngineConfig {
+        accounting_method: AccountingMethod::Fifo,
+        fx_routing: FxRoutingConfig {
+            allow_inverse: true,
+            cross_rate_pivots: Vec::new(),
+        },
+        ..EngineConfig::default()
+    });
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine
+        .apply(fx(2, CurrencyId::usd(), eur(), "0.80"))
+        .unwrap();
+    engine.apply(fill(3, Side::Buy, 10, "100.00", "0")).unwrap();
+    engine
+        .apply(fx(4, CurrencyId::usd(), eur(), "0.75"))
+        .unwrap();
+    engine.apply(fill(5, Side::Sell, 4, "110.00", "0")).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let lots: Vec<_> = engine.lots_for_position(position_key()).collect();
+
+    assert_eq!(summary.realized_pnl, money("86.6667"));
+    assert_eq!(
+        engine.position(position_key()).unwrap().cost_basis,
+        money("750.00")
+    );
+    assert_eq!(lots.len(), 1);
+    assert_eq!(lots[0].remaining_cost_basis, money("750.00"));
+}
+
+#[test]
+fn snapshot_restore_preserves_fx_routing_config() {
+    let mut engine = setup_eur_instrument_usd_account_with_config(EngineConfig {
+        fx_routing: FxRoutingConfig {
+            allow_inverse: true,
+            cross_rate_pivots: vec![gbp()],
+        },
+        ..EngineConfig::default()
+    });
+    engine
+        .register_currency(CurrencyMeta {
+            currency_id: gbp(),
+            code: "GBP".to_string(),
+            scale: ACCOUNT_MONEY_SCALE,
+        })
+        .unwrap();
+    engine.apply(initial(1, "10000.00")).unwrap();
+
+    let mut bytes = Vec::new();
+    engine.write_snapshot(&mut bytes).unwrap();
+    let restored = Engine::read_snapshot(bytes.as_slice()).unwrap();
+
+    assert!(restored.config().fx_routing.allow_inverse);
+    assert_eq!(restored.config().fx_routing.cross_rate_pivots, vec![gbp()]);
+    assert_eq!(restored.state_hash(), engine.state_hash());
+}
+
+#[test]
 fn cross_currency_close_realizes_pnl_at_current_fx_rate() {
     let mut engine = setup_eur_instrument_usd_account();
     engine.apply(initial(1, "10000.00")).unwrap();
@@ -183,6 +302,110 @@ fn cross_currency_close_realizes_pnl_at_current_fx_rate() {
     assert_eq!(summary.realized_pnl, money("88.00"));
     assert_eq!(summary.equity, money("10088.00"));
     assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn split_adjusts_position_lots_and_marks_without_cash_change() {
+    let mut engine = setup_with_accounting_method(AccountingMethod::Fifo);
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 100, "10.00", "0")).unwrap();
+    engine.apply(mark(3, "12.00")).unwrap();
+
+    let result = engine.apply(split(4, 2, 1)).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    let pos = engine.position(position_key()).unwrap();
+    let lots = engine.lots_for_position(position_key()).collect::<Vec<_>>();
+    assert_eq!(result.changed_positions, vec![position_key()]);
+    assert_eq!(result.cash_delta, money("0.00"));
+    assert_eq!(result.realized_pnl_delta, money("0.00"));
+    assert_eq!(pos.signed_qty, Qty::from_units(200));
+    let split_price = price("5.00").to_scale(4, RoundingMode::HalfEven).unwrap();
+    assert_eq!(pos.avg_price, Some(split_price));
+    assert_eq!(pos.cost_basis, money("1000.00"));
+    assert_eq!(summary.cash, money("9000.00"));
+    assert_eq!(summary.position_market_value, money("1200.00"));
+    assert_eq!(summary.unrealized_pnl, money("200.00"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+    assert_eq!(lots.len(), 1);
+    assert_eq!(lots[0].remaining_qty, Qty::from_units(200));
+    assert_eq!(lots[0].original_qty, Qty::from_units(200));
+    assert_eq!(lots[0].entry_price, split_price);
+    assert_eq!(lots[0].remaining_cost_basis, money("1000.00"));
+}
+
+#[test]
+fn reverse_split_requires_exact_quantity_scale() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 3, "10.00", "0")).unwrap();
+
+    let err = engine.apply(split(3, 1, 2)).unwrap_err();
+
+    assert_eq!(err, Error::InvalidScale);
+}
+
+#[test]
+fn symbol_change_updates_instrument_metadata_without_position_change() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 10, "10.00", "0")).unwrap();
+
+    let result = engine.apply(symbol_change(3, "META")).unwrap();
+
+    assert_eq!(engine.instrument(INSTRUMENT).unwrap().symbol, "META");
+    assert_eq!(result.changed_positions, Vec::new());
+    assert_eq!(
+        engine.position(position_key()).unwrap().signed_qty,
+        Qty::from_units(10)
+    );
+}
+
+#[test]
+fn lifecycle_events_block_new_fills_until_reactivated() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine
+        .apply(instrument_lifecycle(2, InstrumentLifecycleState::Halted))
+        .unwrap();
+
+    let err = engine
+        .apply(fill(3, Side::Buy, 10, "10.00", "0"))
+        .unwrap_err();
+    assert_eq!(err, Error::InactiveInstrument(INSTRUMENT));
+
+    engine
+        .apply(instrument_lifecycle(3, InstrumentLifecycleState::Active))
+        .unwrap();
+    engine.apply(fill(4, Side::Buy, 10, "10.00", "0")).unwrap();
+    assert_eq!(
+        engine.instrument_lifecycle(INSTRUMENT).unwrap(),
+        InstrumentLifecycleState::Active
+    );
+}
+
+#[test]
+fn correction_replay_resets_lifecycle_before_historical_fills() {
+    let mut engine = setup();
+    engine.apply(initial(1, "10000.00")).unwrap();
+    engine.apply(fill(2, Side::Buy, 10, "10.00", "0")).unwrap();
+    engine
+        .apply(instrument_lifecycle(3, InstrumentLifecycleState::Halted))
+        .unwrap();
+
+    let replacement = replacement_fill(Side::Buy, 10, "9.00", "0", CurrencyId::usd());
+    engine
+        .apply(correct_fill(4, EventId(2), replacement))
+        .unwrap();
+
+    assert_eq!(
+        engine.instrument_lifecycle(INSTRUMENT).unwrap(),
+        InstrumentLifecycleState::Halted
+    );
+    assert_eq!(
+        engine.position(position_key()).unwrap().cost_basis,
+        money("90.00")
+    );
 }
 
 #[test]
@@ -274,6 +497,80 @@ fn cash_adjustment_is_external_flow_not_pnl() {
     assert_eq!(summary.total_pnl, money("0.00"));
     assert_eq!(summary.net_external_cash_flows, money("250.00"));
     assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn financing_events_credit_cash_realized_pnl_and_separate_buckets() {
+    let mut engine = setup();
+    engine.apply(initial(1, "1000.00")).unwrap();
+    engine.apply(interest(2, "5.00")).unwrap();
+    engine.apply(borrow(3, "-1.50")).unwrap();
+    engine.apply(funding(4, "-2.25")).unwrap();
+    engine.apply(financing(5, "0.75")).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    assert_eq!(summary.cash, money("1002.00"));
+    assert_eq!(summary.trading_realized_pnl, money("0.00"));
+    assert_eq!(summary.interest_pnl, money("5.00"));
+    assert_eq!(summary.borrow_pnl, money("-1.50"));
+    assert_eq!(summary.funding_pnl, money("-2.25"));
+    assert_eq!(summary.financing_pnl, money("0.75"));
+    assert_eq!(summary.total_financing_pnl, money("2.00"));
+    assert_eq!(summary.realized_pnl, money("2.00"));
+    assert_eq!(summary.total_pnl, money("2.00"));
+    assert_eq!(summary.net_external_cash_flows, money("0.00"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+    assert_eq!(engine.positions().count(), 0);
+}
+
+#[test]
+fn financing_pnl_is_inclusive_but_does_not_change_trading_realized_pnl() {
+    let mut engine = setup();
+    engine.apply(initial(1, "1000.00")).unwrap();
+    engine
+        .apply(fill(2, Side::Buy, 10, "10.00", "1.00"))
+        .unwrap();
+    engine
+        .apply(fill(3, Side::Sell, 10, "12.00", "0.50"))
+        .unwrap();
+    let result = engine.apply(interest(4, "-3.00")).unwrap();
+
+    let summary = engine.account_summary(ACCOUNT).unwrap();
+    assert_eq!(result.changed_positions, Vec::new());
+    assert_eq!(result.cash_delta, money("-3.00"));
+    assert_eq!(result.realized_pnl_delta, money("-3.00"));
+    assert_eq!(summary.trading_realized_pnl, money("18.50"));
+    assert_eq!(summary.total_financing_pnl, money("-3.00"));
+    assert_eq!(summary.realized_pnl, money("15.50"));
+    assert_eq!(summary.total_pnl, money("15.50"));
+    assert_eq!(summary.pnl_reconciliation_delta, money("0.00"));
+}
+
+#[test]
+fn financing_events_require_account_currency_amounts() {
+    let mut engine = setup_eur_instrument_usd_account();
+    engine.apply(initial(1, "1000.00")).unwrap();
+    let err = engine
+        .apply(Event {
+            seq: 2,
+            event_id: EventId(2),
+            ts_unix_ns: 2,
+            kind: EventKind::Funding(FinancingEvent {
+                account_id: ACCOUNT,
+                currency_id: eur(),
+                amount: money_in("-1.00", eur()),
+                reason: None,
+            }),
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        Error::CurrencyMismatch {
+            money_currency: eur(),
+            expected_currency: CurrencyId::usd()
+        }
+    );
 }
 
 #[test]
