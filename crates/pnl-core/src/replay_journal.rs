@@ -119,12 +119,11 @@ impl ReplayJournal {
         let mut rebuilt = engine.clone();
         let mut replayed = Self::new();
 
-        reset_canonical_accounting_state(&mut rebuilt);
-
+        let mut canonical_events = Vec::new();
         for event in &self.events {
             replayed.validate_next_event(rebuilt.config.expected_start_seq, event)?;
             if let Some(kind) = canonical_accounting_kind(event, &overrides) {
-                rebuilt.apply_accounting_event_without_journal(event, &kind)?;
+                canonical_events.push((event, kind));
             }
             replayed.record_replayed_event(event);
         }
@@ -133,6 +132,7 @@ impl ReplayJournal {
             return Err(Error::SnapshotValidation("journal state invalid"));
         }
 
+        rebuilt.replay_canonical_journal(canonical_events)?;
         rebuilt.replay_journal = self.clone();
         Ok(rebuilt)
     }
@@ -261,31 +261,6 @@ fn canonical_accounting_kind(
         EventKind::TradeCorrection(_) | EventKind::TradeBust(_) => None,
         _ => Some(event.kind.clone()),
     }
-}
-
-fn reset_canonical_accounting_state(engine: &mut Engine) {
-    for account in engine.accounts.values_mut() {
-        let zero = Money::zero(account.base_currency, engine.config.account_money_scale);
-        account.initial_cash = zero;
-        account.cash = zero;
-        account.net_external_cash_flows = zero;
-        account.trading_realized_pnl = zero;
-        account.interest_pnl = zero;
-        account.borrow_pnl = zero;
-        account.funding_pnl = zero;
-        account.financing_pnl = zero;
-        account.total_financing_pnl = zero;
-        account.realized_pnl = zero;
-        account.peak_equity = zero;
-        account.current_drawdown = zero;
-        account.max_drawdown = zero;
-        account.initial_cash_set = false;
-    }
-    engine.positions.clear();
-    engine.lots.clear();
-    engine.marks.clear();
-    engine.fx_rates.clear();
-    engine.registry.reset_instrument_lifecycles();
 }
 
 fn ensure_same_fill_key(original: &Fill, replacement: &Fill) -> Result<()> {

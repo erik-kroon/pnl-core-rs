@@ -46,6 +46,119 @@ pub(crate) struct ValuationStores<'a> {
     pub(crate) fx_rates: &'a mut BTreeMap<(CurrencyId, CurrencyId), FxRate>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FxRateResolution {
+    rate: Price,
+    used_legs: Vec<(CurrencyId, CurrencyId)>,
+}
+
+struct FxRateResolver<'a> {
+    rates: &'a BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+    config: &'a ValuationConfig,
+}
+
+impl<'a> FxRateResolver<'a> {
+    fn new(
+        rates: &'a BTreeMap<(CurrencyId, CurrencyId), FxRate>,
+        config: &'a ValuationConfig,
+    ) -> Self {
+        Self { rates, config }
+    }
+
+    fn resolve(
+        &self,
+        from_currency_id: CurrencyId,
+        to_currency_id: CurrencyId,
+    ) -> Result<FxRateResolution> {
+        if let Some(resolution) = self.direct_resolution(from_currency_id, to_currency_id) {
+            return Ok(resolution);
+        }
+        if let Some(resolution) = self.leg_resolution(from_currency_id, to_currency_id)? {
+            return Ok(resolution);
+        }
+        for pivot in &self.config.fx_routing.cross_rate_pivots {
+            if *pivot == from_currency_id || *pivot == to_currency_id {
+                continue;
+            }
+            let Some(first) = self.leg_resolution(from_currency_id, *pivot)? else {
+                continue;
+            };
+            let Some(second) = self.leg_resolution(*pivot, to_currency_id)? else {
+                continue;
+            };
+            let mut used_legs = first.used_legs;
+            used_legs.extend(second.used_legs);
+            return Ok(FxRateResolution {
+                rate: multiply_rates(first.rate, second.rate)?,
+                used_legs,
+            });
+        }
+        Err(Error::MissingFxRate {
+            from_currency: from_currency_id,
+            to_currency: to_currency_id,
+        })
+    }
+
+    fn route_uses_pair(
+        &self,
+        from_currency_id: CurrencyId,
+        to_currency_id: CurrencyId,
+        updated_from_currency_id: CurrencyId,
+        updated_to_currency_id: CurrencyId,
+    ) -> bool {
+        if from_currency_id == to_currency_id {
+            return false;
+        }
+        let Ok(resolution) = self.resolve(from_currency_id, to_currency_id) else {
+            return false;
+        };
+        resolution
+            .used_legs
+            .contains(&(updated_from_currency_id, updated_to_currency_id))
+    }
+
+    fn direct_resolution(
+        &self,
+        from_currency_id: CurrencyId,
+        to_currency_id: CurrencyId,
+    ) -> Option<FxRateResolution> {
+        self.direct_rate(from_currency_id, to_currency_id)
+            .map(|rate| FxRateResolution {
+                rate,
+                used_legs: vec![(from_currency_id, to_currency_id)],
+            })
+    }
+
+    fn leg_resolution(
+        &self,
+        from_currency_id: CurrencyId,
+        to_currency_id: CurrencyId,
+    ) -> Result<Option<FxRateResolution>> {
+        if let Some(resolution) = self.direct_resolution(from_currency_id, to_currency_id) {
+            return Ok(Some(resolution));
+        }
+        if self.config.fx_routing.allow_inverse {
+            if let Some(rate) = self.direct_rate(to_currency_id, from_currency_id) {
+                return Ok(Some(FxRateResolution {
+                    rate: invert_rate(rate, self.config)?,
+                    used_legs: vec![(to_currency_id, from_currency_id)],
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn direct_rate(
+        &self,
+        from_currency_id: CurrencyId,
+        to_currency_id: CurrencyId,
+    ) -> Option<Price> {
+        self.rates
+            .get(&(from_currency_id, to_currency_id))
+            .map(|rate| rate.rate)
+    }
+}
+
 pub(crate) fn apply_mark_update(
     mark: &MarkPriceUpdate,
     stores: ValuationStores<'_>,
@@ -166,7 +279,9 @@ pub(crate) fn convert_money(
             config.rounding_mode,
         );
     }
-    let rate = resolved_rate(rates, money.currency_id, to_currency_id, &config)?;
+    let rate = FxRateResolver::new(rates, &config)
+        .resolve(money.currency_id, to_currency_id)?
+        .rate;
     convert_money_with_rate(
         money,
         to_currency_id,
@@ -183,7 +298,9 @@ pub(crate) fn ensure_resolved_rate(
     config: &ValuationConfig,
 ) -> Result<()> {
     if from_currency_id == to_currency_id
-        || resolved_rate(rates, from_currency_id, to_currency_id, config).is_ok()
+        || FxRateResolver::new(rates, config)
+            .resolve(from_currency_id, to_currency_id)
+            .is_ok()
     {
         return Ok(());
     }
@@ -324,13 +441,11 @@ fn positions_affected_by_fx_rate(
             let Ok(account_currency) = registry.account_currency(key.account_id) else {
                 return false;
             };
-            selected_route_uses_pair(
-                rates,
+            FxRateResolver::new(rates, config).route_uses_pair(
                 instrument.currency_id,
                 account_currency,
                 from_currency_id,
                 to_currency_id,
-                config,
             )
         })
         .collect()
@@ -348,114 +463,6 @@ fn ensure_resolved_rates_for_positions(
         ensure_resolved_rate(rates, instrument_currency_id, account_currency, config)?;
     }
     Ok(())
-}
-
-fn resolved_rate(
-    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
-    from_currency_id: CurrencyId,
-    to_currency_id: CurrencyId,
-    config: &ValuationConfig,
-) -> Result<Price> {
-    if let Some(rate) = direct_rate(rates, from_currency_id, to_currency_id) {
-        return Ok(rate);
-    }
-    if let Some(rate) = leg_rate(rates, from_currency_id, to_currency_id, config)? {
-        return Ok(rate);
-    }
-    for pivot in &config.fx_routing.cross_rate_pivots {
-        if *pivot == from_currency_id || *pivot == to_currency_id {
-            continue;
-        }
-        let Some(first) = leg_rate(rates, from_currency_id, *pivot, config)? else {
-            continue;
-        };
-        let Some(second) = leg_rate(rates, *pivot, to_currency_id, config)? else {
-            continue;
-        };
-        return multiply_rates(first, second);
-    }
-    Err(Error::MissingFxRate {
-        from_currency: from_currency_id,
-        to_currency: to_currency_id,
-    })
-}
-
-fn selected_route_uses_pair(
-    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
-    from_currency_id: CurrencyId,
-    to_currency_id: CurrencyId,
-    updated_from_currency_id: CurrencyId,
-    updated_to_currency_id: CurrencyId,
-    config: &ValuationConfig,
-) -> bool {
-    if from_currency_id == to_currency_id {
-        return false;
-    }
-    if direct_rate(rates, from_currency_id, to_currency_id).is_some() {
-        return from_currency_id == updated_from_currency_id
-            && to_currency_id == updated_to_currency_id;
-    }
-    if let Ok(Some(used)) = leg_rate_source(rates, from_currency_id, to_currency_id, config) {
-        return used == (updated_from_currency_id, updated_to_currency_id);
-    }
-    for pivot in &config.fx_routing.cross_rate_pivots {
-        if *pivot == from_currency_id || *pivot == to_currency_id {
-            continue;
-        }
-        let Ok(Some(first)) = leg_rate_source(rates, from_currency_id, *pivot, config) else {
-            continue;
-        };
-        let Ok(Some(second)) = leg_rate_source(rates, *pivot, to_currency_id, config) else {
-            continue;
-        };
-        return first == (updated_from_currency_id, updated_to_currency_id)
-            || second == (updated_from_currency_id, updated_to_currency_id);
-    }
-    false
-}
-
-fn direct_rate(
-    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
-    from_currency_id: CurrencyId,
-    to_currency_id: CurrencyId,
-) -> Option<Price> {
-    rates
-        .get(&(from_currency_id, to_currency_id))
-        .map(|rate| rate.rate)
-}
-
-fn leg_rate(
-    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
-    from_currency_id: CurrencyId,
-    to_currency_id: CurrencyId,
-    config: &ValuationConfig,
-) -> Result<Option<Price>> {
-    if let Some(rate) = direct_rate(rates, from_currency_id, to_currency_id) {
-        return Ok(Some(rate));
-    }
-    if config.fx_routing.allow_inverse {
-        if let Some(rate) = direct_rate(rates, to_currency_id, from_currency_id) {
-            return Ok(Some(invert_rate(rate, config)?));
-        }
-    }
-    Ok(None)
-}
-
-fn leg_rate_source(
-    rates: &BTreeMap<(CurrencyId, CurrencyId), FxRate>,
-    from_currency_id: CurrencyId,
-    to_currency_id: CurrencyId,
-    config: &ValuationConfig,
-) -> Result<Option<(CurrencyId, CurrencyId)>> {
-    if direct_rate(rates, from_currency_id, to_currency_id).is_some() {
-        return Ok(Some((from_currency_id, to_currency_id)));
-    }
-    if config.fx_routing.allow_inverse
-        && direct_rate(rates, to_currency_id, from_currency_id).is_some()
-    {
-        return Ok(Some((to_currency_id, from_currency_id)));
-    }
-    Ok(None)
 }
 
 fn invert_rate(rate: Price, config: &ValuationConfig) -> Result<Price> {
@@ -808,6 +815,39 @@ mod tests {
         let converted = convert_money(money("10.00", eur()), usd(), &rates, config).unwrap();
 
         assert_eq!(converted, money("18.00", usd()));
+    }
+
+    #[test]
+    fn fx_rate_resolver_reports_used_rate_legs_for_inverse_pivot_route() {
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            (gbp(), eur()),
+            FxRate {
+                from_currency_id: gbp(),
+                to_currency_id: eur(),
+                rate: price("1.25"),
+                ts_unix_ns: 1,
+            },
+        );
+        rates.insert(
+            (gbp(), usd()),
+            FxRate {
+                from_currency_id: gbp(),
+                to_currency_id: usd(),
+                rate: price("1.50"),
+                ts_unix_ns: 2,
+            },
+        );
+        let mut config = config();
+        config.fx_routing.allow_inverse = true;
+        config.fx_routing.cross_rate_pivots = vec![gbp()];
+
+        let resolution = FxRateResolver::new(&rates, &config)
+            .resolve(eur(), usd())
+            .unwrap();
+
+        assert_eq!(resolution.rate, price("1.20000000"));
+        assert_eq!(resolution.used_legs, vec![(gbp(), eur()), (gbp(), usd())]);
     }
 
     #[test]
