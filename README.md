@@ -316,6 +316,10 @@ Events are newline-delimited JSON:
 {"seq":4,"type":"interest","account_id":1,"currency":"USD","amount":"12.50","reason":"cash interest","ts_unix_ns":4}
 ```
 
+See [Replay Event JSON Schema](docs/replay-event-schema.md) for the full CLI
+event shape and compatibility contract, including required fields, defaults, and
+unknown-field behavior.
+
 ## Snapshots
 
 Binary snapshots use:

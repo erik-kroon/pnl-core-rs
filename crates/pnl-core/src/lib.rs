@@ -8,6 +8,7 @@ pub mod account;
 mod account_metrics;
 mod accounting;
 pub mod config;
+pub(crate) mod corporate_actions;
 pub mod engine;
 mod error;
 pub mod event;

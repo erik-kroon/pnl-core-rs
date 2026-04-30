@@ -58,7 +58,6 @@ dates.
 
 ## API And Integration Candidates
 
-- Versioned event schema documentation with compatibility rules.
 - Stable serde JSON representation for public API events and summaries.
 - Optional no-std evaluation for the fixed-point/accounting core if dependency
   shape allows it.
@@ -80,7 +79,8 @@ dates.
 ## Release Readiness Checklist
 
 - All documented invariants have focused regression tests.
-- Snapshot compatibility behavior is documented for the release.
+- Snapshot and CLI event schema compatibility behavior are documented for the
+  release.
 - Snapshot binary, JSON, and state hash outputs have checked-in golden coverage.
 - The workspace MSRV and CI command set are documented for the release.
 - CLI fixtures cover the main README workflows.

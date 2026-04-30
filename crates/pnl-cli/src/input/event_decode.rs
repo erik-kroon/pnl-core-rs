@@ -120,7 +120,7 @@ impl<'a> EventFields<'a> {
             side,
             qty: self.required_qty("qty")?,
             price: self.required_price("price")?,
-            fee: self.money_with_default(
+            fee: self.optional_money_with_default(
                 "fee",
                 "0",
                 self.currency("fee_currency", config.base_currency)?,
@@ -186,6 +186,21 @@ impl<'a> EventFields<'a> {
 
     fn required_money(&self, field: &str, currency_id: CurrencyId, scale: u8) -> Result<Money> {
         self.money_with_default(field, self.required_str(field)?, currency_id, scale)
+    }
+
+    fn optional_money_with_default(
+        &self,
+        field: &str,
+        fallback: &str,
+        currency_id: CurrencyId,
+        scale: u8,
+    ) -> Result<Money> {
+        self.money_with_default(
+            field,
+            self.optional_str(field)?.unwrap_or(fallback),
+            currency_id,
+            scale,
+        )
     }
 
     fn money_with_default(

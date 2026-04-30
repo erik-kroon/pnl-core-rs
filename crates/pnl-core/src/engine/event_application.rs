@@ -1,7 +1,8 @@
 use super::Engine;
 use crate::account_metrics::AccountMetrics;
 use crate::accounting::{self, FillAccountingConfig, FillAccountingInput, FillAccountingState};
-use crate::error::{Error, Result};
+use crate::corporate_actions::{self, CorporateActionState};
+use crate::error::Result;
 use crate::event::{
     CashAdjustment, Event, EventKind, Fill, FinancingEvent, FxRateUpdate, InitialCash,
     InstrumentLifecycle, InstrumentSplit, InstrumentSymbolChange, MarkPriceUpdate,
@@ -326,85 +327,25 @@ impl<'a> EventApplication<'a> {
     }
 
     fn apply_split(&mut self, split: &InstrumentSplit) -> Result<()> {
-        if split.numerator == 0 || split.denominator == 0 {
-            return Err(Error::InvalidSplitRatio);
-        }
-        let instrument = self
-            .engine
-            .registry
-            .instrument(split.instrument_id)?
-            .clone();
-        let valuation_config = self.valuation_config();
-        let numerator = i128::from(split.numerator);
-        let denominator = i128::from(split.denominator);
+        let update = corporate_actions::apply_split(
+            split,
+            CorporateActionState {
+                registry: &self.engine.registry,
+                positions: &self.engine.positions,
+                lots: &self.engine.lots,
+                marks: &self.engine.marks,
+                fx_rates: &self.engine.fx_rates,
+            },
+            self.valuation_config(),
+            self.engine.config.rounding_mode,
+            self.event.ts_unix_ns,
+        )?;
 
-        let mut next_marks = self.engine.marks.clone();
-        let mut next_lots = self.engine.lots.clone();
-        let mut next_positions = self.engine.positions.clone();
-        let mut changed_keys = Vec::new();
+        self.engine.marks = update.stores.marks;
+        self.engine.lots = update.stores.lots;
+        self.engine.positions = update.stores.positions;
 
-        if let Some(mark) = next_marks.get_mut(&split.instrument_id) {
-            mark.price = adjust_split_price(
-                mark.price,
-                numerator,
-                denominator,
-                instrument.price_scale,
-                self.engine.config.rounding_mode,
-            )?;
-            mark.ts_unix_ns = self.event.ts_unix_ns;
-        }
-
-        for lot in next_lots
-            .values_mut()
-            .filter(|lot| lot.instrument_id == split.instrument_id)
-        {
-            lot.original_qty = adjust_split_qty(lot.original_qty, numerator, denominator)?;
-            lot.remaining_qty = adjust_split_qty(lot.remaining_qty, numerator, denominator)?;
-            lot.entry_price = adjust_split_price(
-                lot.entry_price,
-                numerator,
-                denominator,
-                instrument.price_scale,
-                self.engine.config.rounding_mode,
-            )?;
-        }
-
-        for (key, position) in next_positions
-            .iter_mut()
-            .filter(|(key, _)| key.instrument_id == split.instrument_id)
-        {
-            let key = *key;
-            let account_currency = self.engine.registry.account_currency(key.account_id)?;
-            position.signed_qty = adjust_split_qty(position.signed_qty, numerator, denominator)?;
-            position.avg_price = position
-                .avg_price
-                .map(|price| {
-                    adjust_split_price(
-                        price,
-                        numerator,
-                        denominator,
-                        instrument.price_scale,
-                        self.engine.config.rounding_mode,
-                    )
-                })
-                .transpose()?;
-            position.updated_at_unix_ns = self.event.ts_unix_ns;
-            valuation::revalue_position(
-                position,
-                &instrument,
-                account_currency,
-                next_marks.get(&key.instrument_id),
-                &self.engine.fx_rates,
-                valuation_config.clone(),
-            )?;
-            changed_keys.push(key);
-        }
-
-        self.engine.marks = next_marks;
-        self.engine.lots = next_lots;
-        self.engine.positions = next_positions;
-
-        for key in changed_keys {
+        for key in update.changed_positions {
             self.effect.require_drawdown_update(key.account_id);
             self.effect.record_changed_position(key);
         }
@@ -426,6 +367,42 @@ impl<'a> EventApplication<'a> {
 }
 
 impl Engine {
+    pub(crate) fn reset_accounting_state(&mut self) {
+        for account in self.accounts.values_mut() {
+            let zero = Money::zero(account.base_currency, self.config.account_money_scale);
+            account.initial_cash = zero;
+            account.cash = zero;
+            account.net_external_cash_flows = zero;
+            account.trading_realized_pnl = zero;
+            account.interest_pnl = zero;
+            account.borrow_pnl = zero;
+            account.funding_pnl = zero;
+            account.financing_pnl = zero;
+            account.total_financing_pnl = zero;
+            account.realized_pnl = zero;
+            account.peak_equity = zero;
+            account.current_drawdown = zero;
+            account.max_drawdown = zero;
+            account.initial_cash_set = false;
+        }
+        self.positions.clear();
+        self.lots.clear();
+        self.marks.clear();
+        self.fx_rates.clear();
+        self.registry.reset_instrument_lifecycles();
+    }
+
+    pub(crate) fn replay_canonical_journal<'a>(
+        &mut self,
+        events: impl IntoIterator<Item = (&'a Event, EventKind)>,
+    ) -> Result<()> {
+        self.reset_accounting_state();
+        for (event, kind) in events {
+            self.apply_accounting_event_without_journal(event, &kind)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_accounting_event_without_journal(
         &mut self,
         event: &Event,
@@ -455,32 +432,6 @@ impl Engine {
         }
         Ok(())
     }
-}
-
-fn adjust_split_qty(qty: Qty, numerator: i128, denominator: i128) -> Result<Qty> {
-    let multiplied = qty
-        .value
-        .checked_mul(numerator)
-        .ok_or(Error::ArithmeticOverflow)?;
-    if multiplied % denominator != 0 {
-        return Err(Error::InvalidScale);
-    }
-    Ok(Qty::new(multiplied / denominator, qty.scale))
-}
-
-fn adjust_split_price(
-    price: Price,
-    numerator: i128,
-    denominator: i128,
-    target_scale: u8,
-    rounding: RoundingMode,
-) -> Result<Price> {
-    let multiplied = price
-        .value
-        .checked_mul(denominator)
-        .ok_or(Error::ArithmeticOverflow)?;
-    let value = div_round(multiplied, numerator, rounding)?;
-    Price::new(value, price.scale).to_scale(target_scale, rounding)
 }
 
 #[cfg(test)]

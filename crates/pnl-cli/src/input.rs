@@ -1,13 +1,18 @@
 use anyhow::{Context, Result};
 use pnl_core::*;
-use serde::Deserialize;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+mod config;
 mod event_decode;
+mod events;
+mod instruments;
 
-use event_decode::{decode_event_line, EventDecodeConfig};
+use config::{build_engine, load_config};
+use events::open_replay_events;
+pub use events::EventIter;
+use instruments::load_instruments;
 
 pub struct ReplayInput {
     pub engine: Engine,
@@ -42,275 +47,12 @@ pub fn open_replay_input_from_snapshot(snapshot: &Path, events: &[PathBuf]) -> R
     Ok(ReplayInput { engine, events })
 }
 
-pub struct EventIter<R> {
-    lines: std::io::Lines<R>,
-    base_currency: CurrencyId,
-    money_scale: u8,
-    line_number: usize,
-    source: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CliConfig {
-    base_currency: String,
-    account_money_scale: Option<u8>,
-    accounting_method: Option<String>,
-    fx_allow_inverse: Option<bool>,
-    fx_cross_rate_pivots: Option<Vec<String>>,
-    allow_short: Option<bool>,
-    allow_position_flip: Option<bool>,
-    expected_start_seq: Option<u64>,
-    currencies: Option<Vec<CliCurrency>>,
-    accounts: Option<Vec<CliAccount>>,
-    books: Option<Vec<CliBook>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CliCurrency {
-    code: String,
-    scale: Option<u8>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CliAccount {
-    account_id: u64,
-    base_currency: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CliBook {
-    account_id: u64,
-    book_id: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstrumentRow {
-    instrument_id: u64,
-    symbol: String,
-    currency: String,
-    price_scale: u8,
-    qty_scale: u8,
-    multiplier: String,
-}
-
-fn load_config(path: &Path) -> Result<CliConfig> {
-    let config_text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    toml::from_str(&config_text).with_context(|| format!("parsing {}", path.display()))
-}
-
-fn build_engine(config: CliConfig, base_currency: CurrencyId) -> Result<Engine> {
-    let mut engine = Engine::new(EngineConfig {
-        base_currency,
-        account_money_scale: config.account_money_scale.unwrap_or(ACCOUNT_MONEY_SCALE),
-        accounting_method: parse_accounting_method(config.accounting_method.as_deref())?,
-        fx_routing: parse_fx_routing(&config)?,
-        allow_short: config.allow_short.unwrap_or(true),
-        allow_position_flip: config.allow_position_flip.unwrap_or(true),
-        expected_start_seq: config.expected_start_seq.unwrap_or(1),
-        ..EngineConfig::default()
-    });
-
-    engine.register_currency(CurrencyMeta {
-        currency_id: base_currency,
-        code: config.base_currency.clone(),
-        scale: engine.config().account_money_scale,
-    })?;
-
-    for currency in config.currencies.unwrap_or_default() {
-        engine.register_currency(CurrencyMeta {
-            currency_id: CurrencyId::from_code(&currency.code)?,
-            code: currency.code,
-            scale: currency
-                .scale
-                .unwrap_or(engine.config().account_money_scale),
-        })?;
-    }
-
-    let accounts = config.accounts.unwrap_or_else(|| {
-        vec![CliAccount {
-            account_id: 1,
-            base_currency: None,
-        }]
-    });
-    for account in accounts {
-        let account_currency = match account.base_currency {
-            Some(code) => {
-                let currency_id = CurrencyId::from_code(&code)?;
-                engine.register_currency(CurrencyMeta {
-                    currency_id,
-                    code,
-                    scale: engine.config().account_money_scale,
-                })?;
-                currency_id
-            }
-            None => base_currency,
-        };
-        engine.register_account(AccountMeta {
-            account_id: AccountId(account.account_id),
-            base_currency: account_currency,
-        })?;
-    }
-
-    let books = config.books.unwrap_or_else(|| {
-        vec![CliBook {
-            account_id: 1,
-            book_id: 1,
-        }]
-    });
-    for book in books {
-        engine.register_book(BookMeta {
-            account_id: AccountId(book.account_id),
-            book_id: BookId(book.book_id),
-        })?;
-    }
-
-    Ok(engine)
-}
-
-fn load_instruments(engine: &mut Engine, path: &Path) -> Result<()> {
-    let rdr =
-        csv::Reader::from_path(path).with_context(|| format!("reading {}", path.display()))?;
-    load_instrument_rows(engine, rdr)
-        .with_context(|| format!("loading instruments from {}", path.display()))
-}
-
-fn load_instrument_rows<R: Read>(engine: &mut Engine, mut rdr: csv::Reader<R>) -> Result<()> {
-    for (idx, row) in rdr.deserialize::<InstrumentRow>().enumerate() {
-        let row = row.with_context(|| format!("parsing instruments row {}", idx + 1))?;
-        let currency_id = parse_currency_field("currency", &row.currency)
-            .with_context(|| format!("parsing instruments row {}", idx + 1))?;
-        engine.register_currency(CurrencyMeta {
-            currency_id,
-            code: row.currency,
-            scale: engine.config().account_money_scale,
-        })?;
-        engine.register_instrument(InstrumentMeta {
-            instrument_id: InstrumentId(row.instrument_id),
-            symbol: row.symbol,
-            currency_id,
-            price_scale: row.price_scale,
-            qty_scale: row.qty_scale,
-            multiplier: FixedI128::parse_decimal(&row.multiplier).with_context(|| {
-                format!(
-                    "parsing instruments row {} field multiplier value {:?}",
-                    idx + 1,
-                    row.multiplier
-                )
-            })?,
-        })?;
-    }
-    Ok(())
-}
-
-fn open_events(
-    path: &Path,
-    base_currency: CurrencyId,
-    money_scale: u8,
-) -> Result<EventIter<BufReader<File>>> {
-    let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let reader = BufReader::new(file);
-    Ok(event_lines_with_source(
-        reader,
-        base_currency,
-        money_scale,
-        Some(path.display().to_string()),
-    ))
-}
-
-pub fn open_replay_events(
-    paths: &[PathBuf],
-    base_currency: CurrencyId,
-    money_scale: u8,
-) -> Result<Vec<EventIter<BufReader<File>>>> {
-    paths
-        .iter()
-        .map(|path| open_events(path, base_currency, money_scale))
-        .collect()
-}
-
-#[cfg(test)]
-fn event_lines<R: BufRead>(reader: R, base_currency: CurrencyId, money_scale: u8) -> EventIter<R> {
-    event_lines_with_source(reader, base_currency, money_scale, None)
-}
-
-fn event_lines_with_source<R: BufRead>(
-    reader: R,
-    base_currency: CurrencyId,
-    money_scale: u8,
-    source: Option<String>,
-) -> EventIter<R> {
-    EventIter {
-        lines: reader.lines(),
-        base_currency,
-        money_scale,
-        line_number: 0,
-        source,
-    }
-}
-
-impl<R: BufRead> Iterator for EventIter<R> {
-    type Item = Result<Event>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let line = self.lines.next()?;
-            self.line_number += 1;
-            let line_number = self.line_number;
-            let line_context = event_line_context(line_number, self.source.as_deref());
-            let line = match line.with_context(|| format!("reading {line_context}")) {
-                Ok(line) => line,
-                Err(error) => return Some(Err(error)),
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            return Some(decode_event_line(
-                &line,
-                EventDecodeConfig {
-                    base_currency: self.base_currency,
-                    money_scale: self.money_scale,
-                },
-                &line_context,
-            ));
-        }
-    }
-}
-
-fn parse_currency_field(field: &str, value: &str) -> Result<CurrencyId> {
-    CurrencyId::from_code(value).with_context(|| format!("invalid field {field} value {value:?}"))
-}
-
-fn parse_accounting_method(value: Option<&str>) -> Result<AccountingMethod> {
-    match value.unwrap_or("average_cost") {
-        "average_cost" => Ok(AccountingMethod::AverageCost),
-        "fifo" => Ok(AccountingMethod::Fifo),
-        "lifo" => Ok(AccountingMethod::Lifo),
-        other => anyhow::bail!("unsupported field accounting_method value {other:?}"),
-    }
-}
-
-fn parse_fx_routing(config: &CliConfig) -> Result<FxRoutingConfig> {
-    let mut cross_rate_pivots = Vec::new();
-    for value in config.fx_cross_rate_pivots.as_deref().unwrap_or(&[]) {
-        cross_rate_pivots.push(parse_currency_field("fx_cross_rate_pivots", value)?);
-    }
-    Ok(FxRoutingConfig {
-        allow_inverse: config.fx_allow_inverse.unwrap_or(false),
-        cross_rate_pivots,
-    })
-}
-
-fn event_line_context(line_number: usize, source: Option<&str>) -> String {
-    match source {
-        Some(source) => format!("events line {line_number} ({source})"),
-        None => format!("events line {line_number}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::config::default_config;
+    use crate::input::events::{event_lines, open_events_for_test};
+    use crate::input::instruments::load_instrument_rows;
     use std::io::Cursor;
     use std::path::PathBuf;
 
@@ -516,6 +258,104 @@ mod tests {
     }
 
     #[test]
+    fn event_schema_defaults_event_id_timestamp_currency_and_fee() {
+        let input = Cursor::new(
+            "{\"seq\":42,\"type\":\"initial_cash\",\"account_id\":1,\"amount\":\"100.00\"}\n\
+             {\"seq\":43,\"type\":\"fill\",\"account_id\":1,\"book_id\":1,\"instrument_id\":1,\"side\":\"buy\",\"qty\":\"2\",\"price\":\"10.00\"}\n",
+        );
+
+        let events = event_lines(input, CurrencyId::usd(), ACCOUNT_MONEY_SCALE)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(events[0].event_id, EventId(42));
+        assert_eq!(events[0].ts_unix_ns, 0);
+        match &events[0].kind {
+            EventKind::InitialCash(initial_cash) => {
+                assert_eq!(initial_cash.currency_id, CurrencyId::usd());
+            }
+            _ => unreachable!("expected initial cash"),
+        }
+        assert_eq!(events[1].event_id, EventId(43));
+        assert_eq!(events[1].ts_unix_ns, 0);
+        match &events[1].kind {
+            EventKind::Fill(fill) => {
+                assert_eq!(
+                    fill.fee,
+                    Money::parse_decimal("0", CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
+                );
+            }
+            _ => unreachable!("expected fill"),
+        }
+    }
+
+    #[test]
+    fn event_schema_ignores_unknown_fields() {
+        let input = Cursor::new(
+            "{\"seq\":1,\"event_id\":99,\"ts_unix_ns\":123,\"type\":\"mark\",\"instrument_id\":1,\"price\":\"10.00\",\"producer_note\":\"ignored\",\"nested\":{\"also\":\"ignored\"}}\n",
+        );
+
+        let event = event_lines(input, CurrencyId::usd(), ACCOUNT_MONEY_SCALE)
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.event_id, EventId(99));
+        assert_eq!(event.ts_unix_ns, 123);
+        assert!(matches!(
+            event.kind,
+            EventKind::Mark(MarkPriceUpdate {
+                instrument_id: InstrumentId(1),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn event_schema_parses_fill_fee_when_present() {
+        let input = Cursor::new(
+            "{\"seq\":1,\"type\":\"fill\",\"account_id\":1,\"book_id\":1,\"instrument_id\":1,\"side\":\"buy\",\"qty\":\"2\",\"price\":\"10.00\",\"fee\":\"1.25\",\"fee_currency\":\"USD\"}\n",
+        );
+
+        let event = event_lines(input, CurrencyId::usd(), ACCOUNT_MONEY_SCALE)
+            .next()
+            .unwrap()
+            .unwrap();
+
+        match event.kind {
+            EventKind::Fill(fill) => {
+                assert_eq!(
+                    fill.fee,
+                    Money::parse_decimal("1.25", CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
+                );
+            }
+            _ => unreachable!("expected fill"),
+        }
+    }
+
+    #[test]
+    fn event_schema_parses_trade_correction_fee_when_present() {
+        let input = Cursor::new(
+            "{\"seq\":2,\"type\":\"trade_correction\",\"original_event_id\":1,\"account_id\":1,\"book_id\":1,\"instrument_id\":1,\"side\":\"sell\",\"qty\":\"2\",\"price\":\"11.00\",\"fee\":\"0.75\",\"fee_currency\":\"USD\"}\n",
+        );
+
+        let event = event_lines(input, CurrencyId::usd(), ACCOUNT_MONEY_SCALE)
+            .next()
+            .unwrap()
+            .unwrap();
+
+        match event.kind {
+            EventKind::TradeCorrection(correction) => {
+                assert_eq!(
+                    correction.replacement.fee,
+                    Money::parse_decimal("0.75", CurrencyId::usd(), ACCOUNT_MONEY_SCALE).unwrap()
+                );
+            }
+            _ => unreachable!("expected trade correction"),
+        }
+    }
+
+    #[test]
     fn reports_missing_instrument_fields_before_replay() {
         let mut engine = build_engine(default_config(), CurrencyId::usd()).unwrap();
         let error = load_instrument_rows(
@@ -552,7 +392,7 @@ mod tests {
             "{\"seq\":1,\"type\":\"mark\",\"instrument_id\":1,\"price\":\"bad\"}\n",
         );
 
-        let error = open_events(&path, CurrencyId::usd(), ACCOUNT_MONEY_SCALE)
+        let error = open_events_for_test(&path, CurrencyId::usd(), ACCOUNT_MONEY_SCALE)
             .unwrap()
             .next()
             .unwrap()
@@ -650,22 +490,6 @@ mod tests {
         let error = build_engine(config, CurrencyId::usd()).unwrap_err();
 
         assert!(format!("{error:#}").contains("invalid field fx_cross_rate_pivots value \"eur\""));
-    }
-
-    fn default_config() -> CliConfig {
-        CliConfig {
-            base_currency: "USD".to_string(),
-            account_money_scale: None,
-            accounting_method: None,
-            fx_allow_inverse: None,
-            fx_cross_rate_pivots: None,
-            allow_short: None,
-            allow_position_flip: None,
-            expected_start_seq: None,
-            currencies: None,
-            accounts: None,
-            books: None,
-        }
     }
 
     fn fixture_dir() -> PathBuf {
